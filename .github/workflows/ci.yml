@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Superseded pull request runs are cancelled; runs on main always finish.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned to commit SHAs rather than their tags: a tag is mutable.
+jobs:
+  checks:
+    name: Format, typecheck, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No `version`: it reads the pinned pnpm from `packageManager` in package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run format:check
+      - run: pnpm run typecheck
+      # Every project: `node`, and the Durable Object in real workerd at the oldest supported compatibility date
+      # (`workers`) and a current one (`workers-current`).
+      - run: pnpm exec vitest run
+      - run: pnpm run build
+      - name: Main entry must not reach cloudflare:workers
+        run: node .github/scripts/check-entry-imports.mjs dist/index.js

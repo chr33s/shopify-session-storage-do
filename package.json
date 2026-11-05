@@ -1,0 +1,60 @@
+{
+  "name": "@optizio/shopify-session-storage-do",
+  "version": "0.2.1",
+  "description": "Shopify session storage for Cloudflare Workers: one Durable Object per shop that encrypts, refreshes and upgrades its offline token",
+  "type": "module",
+  "license": "MIT",
+  "author": "Optizio",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/optizio/shopify-session-storage-do.git"
+  },
+  "homepage": "https://github.com/optizio/shopify-session-storage-do#readme",
+  "keywords": [
+    "shopify",
+    "session-storage",
+    "cloudflare",
+    "durable-objects",
+    "workers"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./durable-object": {
+      "types": "./dist/durable-object.d.ts",
+      "import": "./dist/durable-object.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@12.4.2",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/workers/tsconfig.json",
+    "test": "vitest --project node",
+    "test:workers": "vitest --project workers --project workers-current",
+    "test:all": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepare": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@shopify/shopify-api": "^15.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.7",
+    "@cloudflare/workers-types": "^5.20261021.1",
+    "@shopify/shopify-api": "^15.0.1",
+    "prettier": "^3.9.10",
+    "typescript": "~5.9.3",
+    "vitest": "~4.1.12"
+  }
+}

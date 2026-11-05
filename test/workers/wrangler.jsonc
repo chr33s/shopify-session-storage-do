@@ -1,0 +1,26 @@
+// Test Worker for the Durable Object integration tests (vitest.config.ts, vitest.current.config.ts).
+{
+  "name": "shop-sessions-test",
+  "main": "./entry.ts",
+  // The oldest compatibility date among the apps that host the Durable Object; vitest.current.config.ts overrides it.
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SHOP_SESSIONS", "class_name": "TestShopSessions" },
+      { "name": "BROKEN_KEYRING", "class_name": "BrokenKeyringShopSessions" },
+      { "name": "NO_CREDENTIALS", "class_name": "NoCredentialsShopSessions" },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TestShopSessions", "BrokenKeyringShopSessions", "NoCredentialsShopSessions"],
+    },
+  ],
+  "kv_namespaces": [
+    { "binding": "REGISTRY", "id": "registry" },
+    { "binding": "LEGACY", "id": "legacy" },
+  ],
+  "vars": { "SHOPIFY_API_KEY": "test-api-key" },
+}

@@ -1,0 +1,14 @@
+# pnpm refuses to run a dependency's install scripts unless it is listed here.
+# workerd and esbuild fetch native binaries for the Workers test project.
+allowBuilds:
+  esbuild: true
+  workerd: true
+minimumReleaseAgeExclude:
+  - '@cloudflare/vitest-plugin@1.4.7'
+  - miniflare@5.20261019.2-beta
+  - wrangler@4.152.0
+# Dev-only: both reach the repo through @cloudflare/vitest-plugin. Security
+# backports that stay inside the installed major line.
+overrides:
+  'undici@>=7.0.0 <7.30.1': '^7.30.1'
+  'zod@>=4.0.0 <4.6.6': '^4.6.6'
