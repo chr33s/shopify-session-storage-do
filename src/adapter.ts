@@ -34,7 +34,8 @@ export type LoadOfflineSessionOptions = {
 }
 
 export type OfflineSessionResult =
-  | { status: 'ok'; session: Session }
+  /** `source: 'app_token'`: an application-only token, served while the shop's own chain can't produce one. */
+  | { status: 'ok'; session: Session; source?: 'app_token' }
   | { status: 'none' }
   | { status: 'needs_reauth'; since: Date; reason: NeedsReauthReason }
   | { status: 'unavailable'; reason: TokenlessReason; retryAfterMs?: number }
@@ -169,8 +170,14 @@ export class DurableObjectSessionStorage {
     }
     const result = await this.call(canonical, (stub) => stub.getSession(input))
     switch (result.status) {
-      case 'ok':
-        return { status: 'ok', session: issueSession(canonical, result.session, result.tokenFp) }
+      case 'ok': {
+        const ok: Extract<OfflineSessionResult, { status: 'ok' }> = {
+          status: 'ok',
+          session: issueSession(canonical, result.session, result.tokenFp),
+        }
+        if (result.source === 'app_token') ok.source = 'app_token'
+        return ok
+      }
       case 'none':
         return { status: 'none' }
       case 'needs_reauth':

@@ -254,6 +254,90 @@ describe('configuration', () => {
   })
 })
 
+describe('app token fallback', () => {
+  async function es256Pem(): Promise<string> {
+    const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+      'sign',
+      'verify',
+    ])) as CryptoKeyPair
+    const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey))
+    return `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...pkcs8))}\n-----END PRIVATE KEY-----`
+  }
+
+  it('turns the fallback off on a malformed key, reporting it once without echoing it, and keeps the chain', async () => {
+    const privateKey = '-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----'
+    const { object, report, fetch } = setup({ appTokenKey: () => ({ kid: 'k1', alg: 'ES256', privateKey }) })
+    expect(await object.putSession(exchange())).toEqual({ status: 'stored' })
+    expect(await object.getSession({ shop: SHOP, caller: 'app' })).toMatchObject({ status: 'ok' })
+    await object.describe({ shop: SHOP })
+    expect(report).toHaveBeenCalledTimes(1)
+    const [error, context] = report.mock.calls[0] ?? []
+    expect(error).toBeInstanceOf(ShopSessionError)
+    expect((error as ShopSessionError).message).toMatch(/not a valid ES256 private key.*fallback is off/)
+    expect((error as ShopSessionError).message).not.toContain('bm90IGEga2V5')
+    expect(context).toEqual({ shop: SHOP, op: 'config', kind: 'configuration', code: 'app_token_key' })
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('turns the fallback off when appTokenKey(env) throws, naming only the error type', async () => {
+    const later = NOW + 10 * 3_600_000
+    const { object, report } = setup({
+      now: () => later,
+      appTokenKey: (env) => JSON.parse(String(env.SHOPIFY_API_SECRET)) as never,
+    })
+    expect(await object.putSession(exchange(later + 3_600_000))).toEqual({ status: 'stored' })
+    expect(report.mock.calls[0]?.[0]?.message).toMatch(
+      /appTokenKey\(env\) threw SyntaxError; the app-token fallback is off/,
+    )
+    expect(report.mock.calls[0]?.[0]?.message).not.toContain('api-secret')
+  })
+
+  it('reports a broken key at most hourly per isolate, across objects', async () => {
+    const later = NOW + 20 * 3_600_000
+    const privateKey = '-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----'
+    const options = { now: () => later, appTokenKey: () => ({ kid: 'k1', alg: 'ES256' as const, privateKey }) }
+    const first = setup(options)
+    const second = setup(options, makeEnv(), 'other.myshopify.com')
+    await first.object.describe({ shop: SHOP })
+    await second.object.describe({ shop: 'other.myshopify.com' })
+    expect(first.report).toHaveBeenCalledTimes(1)
+    expect(second.report).not.toHaveBeenCalled()
+  })
+
+  it('is off when appTokenKey returns undefined', async () => {
+    const { object, fetch } = setup({ appTokenKey: () => undefined })
+    const expired = exchange(NOW - MINUTE)
+    await object.putSession({ ...expired, session: { ...expired.session, refreshToken: undefined } })
+    expect(await object.getSession({ shop: SHOP, caller: 'app' })).toMatchObject({ status: 'needs_reauth' })
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('mints through the shop token endpoint for an app caller once the chain is rejected', async () => {
+    const privateKey = await es256Pem()
+    const fetch = vi.fn(async (_url: string, init: RequestInit) =>
+      String(init.body).startsWith('grant_type=client_credentials')
+        ? Response.json({ access_token: 'shpat_app', expires_in: 3599, scope: 'read_products' })
+        : Response.json({ error: 'invalid_request' }, { status: 401 }),
+    )
+    const { object } = setup({
+      appTokenKey: () => ({ kid: 'k1', alg: 'ES256', privateKey }),
+      fetch: fetch as unknown as typeof globalThis.fetch,
+    })
+    await object.putSession(exchange(NOW - MINUTE))
+    expect(await object.getSession({ shop: SHOP, caller: 'library' })).toMatchObject({ status: 'needs_reauth' })
+    expect(await object.getSession({ shop: SHOP, caller: 'app' })).toMatchObject({
+      status: 'ok',
+      source: 'app_token',
+      session: { accessToken: 'shpat_app', expires: NOW + 3599_000 },
+    })
+    expect(fetch).toHaveBeenCalledTimes(2)
+    const [url, init] = fetch.mock.calls[1] ?? []
+    expect(url).toBe(`https://${SHOP}/admin/oauth/access_token`)
+    expect(String(init?.body)).not.toContain('api-secret')
+    expect(await object.describe({ shop: SHOP })).toMatchObject({ fallback: { kid: 'k1', expires: NOW + 3599_000 } })
+  })
+})
+
 describe('storage bindings', () => {
   it('deletes all storage and then the alarm on destroy', async () => {
     const { object, order, data, alarm } = setup()

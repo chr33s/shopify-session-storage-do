@@ -7,6 +7,7 @@ import type { ShopSessionsOptions } from '../../../src/core/shop-sessions.js'
 import type {
   AlarmControl,
   AlarmErrors,
+  AppTokenClient,
   CoreDeps,
   Keyring,
   KVNamespaceLike,
@@ -287,8 +288,57 @@ export class FakeTokens implements TokenClient {
   }
 }
 
+/** Scripted application-only token grant. Unscripted mints are recorded and throw, like FakeTokens. */
+export class FakeAppTokens implements AppTokenClient {
+  kid = 'sig-kid-1'
+  calls: string[] = []
+  unexpected = 0
+  private queue: Scripted[] = []
+
+  onMint(...results: Scripted[]): this {
+    this.queue.push(...results)
+    return this
+  }
+
+  deferMint(): Deferred<TokenCallResult> {
+    const d = deferred<TokenCallResult>()
+    this.queue.push(d)
+    return d
+  }
+
+  pending(): number {
+    return this.queue.length
+  }
+
+  async mint(shop: string): Promise<TokenCallResult> {
+    this.calls.push(shop)
+    const next = this.queue.shift()
+    if (next === undefined) {
+      this.unexpected++
+      throw new Error('unexpected mint call')
+    }
+    if (next instanceof Error) throw next
+    if ('promise' in next) return next.promise
+    return next
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Result builders
+
+/** A successful application-only token grant (no refresh token). */
+export function minted(clock: Clock, access: string, fields: { expiresIn?: number | null; scope?: string } = {}) {
+  const result: TokenCallResult = {
+    outcome: 'success',
+    sentAt: clock.now(),
+    accessToken: access,
+    missing: [],
+    requestId: 'req-mint',
+  }
+  if (fields.expiresIn !== null) result.expiresIn = fields.expiresIn ?? 3599
+  if (fields.scope !== undefined) result.scope = fields.scope
+  return result
+}
 
 export function success(
   clock: Clock,
@@ -342,6 +392,8 @@ export function failure(
 // Harness
 
 export type HarnessOptions = {
+  /** Configure the application-only token fallback. */
+  appTokens?: boolean
   legacy?: boolean
   migrateLegacy?: boolean
   callerWaitMs?: number
@@ -370,6 +422,7 @@ export function createHarness(options: HarnessOptions = {}) {
   const store = new FakeStore(alarm)
   const keyring = new FakeKeyring()
   const tokens = new FakeTokens(clock)
+  const appTokens = options.appTokens ? new FakeAppTokens() : undefined
   const registry = new FakeKV()
   const legacyKv = options.legacy ? new FakeKV() : undefined
   const reports: ShopSessionError[] = []
@@ -385,6 +438,7 @@ export function createHarness(options: HarnessOptions = {}) {
     store,
     alarm,
     tokens,
+    appTokens,
     keyring,
     credFp: options.credFp ?? CRED_FP,
     registry: { kv: registry, prefix: 'shop-session:' },
@@ -411,6 +465,10 @@ export function createHarness(options: HarnessOptions = {}) {
     ).toEqual({
       refresh: 0,
       migrate: 0,
+    })
+    expect({ unexpected: appTokens?.unexpected ?? 0, unused: appTokens?.pending() ?? 0 }, 'app token mints').toEqual({
+      unexpected: 0,
+      unused: 0,
     })
   })
 
@@ -477,11 +535,12 @@ export function createHarness(options: HarnessOptions = {}) {
     }
   }
 
-  /** Plaintext of the current stored token / refresh token / alternates. */
+  /** Plaintext of the current stored token / refresh token / alternates / fallback token. */
   function stored() {
     const r = store.record
     return {
       token: keyring.peek(r?.token)?.plaintext,
+      fallback: keyring.peek(r?.fallback?.token)?.plaintext,
       refresh: keyring.peek(r?.refresh)?.plaintext,
       alternates: (r?.alternates ?? []).map((a) => keyring.peek(a.refresh)?.plaintext),
       record: r,
@@ -494,6 +553,7 @@ export function createHarness(options: HarnessOptions = {}) {
     store,
     keyring,
     tokens,
+    appTokens,
     registry,
     legacyKv,
     reports,

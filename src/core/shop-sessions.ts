@@ -13,6 +13,8 @@ import { canonicalShop } from '../shop.js'
 import { LEGACY_OFFLINE_PREFIX, LEGACY_SHOP_LIST_PREFIX, ShopSessionError } from '../types.js'
 import type {
   AlarmErrors,
+  AppTokenClient,
+  FallbackToken,
   CoreDeps,
   DescribeInput,
   DestroyInput,
@@ -38,9 +40,13 @@ import type {
 } from '../types.js'
 import {
   CALLER_WAIT,
+  DEFAULT_EXPIRES_IN,
   DEFAULT_REFRESH_EXPIRES_IN,
   HOUR,
+  MINT_BACKOFF,
   MIN_ALARM_DELAY,
+  QUARANTINE_GC,
+  SECOND,
   acceptsLegacyExchange,
   acceptsNoRefreshExchange,
   alarmAction,
@@ -52,6 +58,11 @@ import {
   describeRecord,
   exchangeRecord,
   failureRecord,
+  fallbackApplies,
+  fallbackFresh,
+  isAppToken,
+  mintRejected,
+  rejectedMint,
   finiteNumber,
   holdsLegacyCopy,
   importedRecord,
@@ -70,6 +81,8 @@ import {
   tokenIntent,
   validSeconds,
   withAlternate,
+  without,
+  withAppTokenFp,
 } from './record.js'
 import type { Alternate, DelayMode, FailureInput, IncomingPair, LegacyParse, TokenIntent } from './record.js'
 
@@ -91,6 +104,21 @@ type PutKind = 'exchange' | 'legacy' | 'no_refresh'
 
 type PutOutcome = { result: PutSessionResult; created?: ShopRecord; dropped?: number }
 
+/** `record` is absent for `none` and `import_failed`. */
+type ChainAnswer = { answer: GetSessionResult; record?: ShopRecord; version: number }
+
+/** The request's CALLER_WAIT deadline, set by its first wait; later waits draw on what is left. */
+type Budget = { until?: number }
+
+/** A mint's outcome; `answer` is the app token it stored, for the caller that started it. */
+type MintResult = { status: CallStatus; answer?: GetSessionResult }
+
+/** Mints Shopify never saw: they say nothing about the shop, so no rejection is stored for them. */
+const NOT_SENT = new Set(['sign_failed', 'invalid_shop'])
+
+/** Most mints one request starts or joins: one for the chain it was answered from, one if that chain changed. */
+const MAX_MINTS_PER_REQUEST = 2
+
 const MAX_SETTLE_ATTEMPTS = 5
 /** Token calls a rollover starts or joins before it gives up on a record that keeps changing. */
 const MAX_ROLLOVER_ROUNDS = 3
@@ -111,6 +139,15 @@ export class ShopSessions implements ShopSessionsRpc {
   private alarmErrors: AlarmErrors | undefined
   /** The alternate-sealed copy of the refresh token this instance last made current from an exchange. */
   private lastExchanged: Alternate | undefined
+  /**
+   * Separate from `inflight`: a mint presents no refresh token, so Shopify's rotation rules don't serialise it with
+   * refreshes, and chain callers never wait on it.
+   */
+  private minting: Promise<MintResult | 'joined'> | undefined
+  /** No mint before this (ms epoch) after a transient failure. In memory: a lost hold costs one mint. */
+  private mintBackoffUntil = 0
+  /** `kind:code` of the last transient mint failure reported, so a repeat is only logged. */
+  private mintReported: string | undefined
 
   constructor(deps: CoreDeps, options: ShopSessionsOptions = {}) {
     this.deps = deps
@@ -123,6 +160,16 @@ export class ShopSessions implements ShopSessionsRpc {
   async getSession(input: GetSessionInput): Promise<GetSessionResult> {
     this.assertShop(input.shop)
     const minValidity = clampMinValidity(input.minValidityMs)
+    const budget: Budget = {}
+    const chain = await this.chainSession(minValidity, budget)
+    const appTokens = this.deps.appTokens
+    // Never for the library: a session from loadSession would stop authenticate.admin from exchanging, and that
+    // exchange is what heals the chain.
+    if (input.caller !== 'app' || !appTokens || !fallbackApplies(chain.answer)) return chain.answer
+    return this.fallbackSession(appTokens, minValidity, budget, chain)
+  }
+
+  private async chainSession(minValidity: number, budget: Budget): Promise<ChainAnswer> {
     let view = await this.load()
     if (!view.record && this.deps.legacyKv) {
       const imported = await this.importLegacy({ shop: this.deps.shop }).then(
@@ -135,13 +182,15 @@ export class ShopSessions implements ShopSessionsRpc {
       view = await this.load()
       // Without the legacy copy a new install can't be told from a shop not imported yet. Answering tokenless lets
       // admin requests exchange and background work retry, where an error would fail them all.
-      if (!view.record && !imported) return { status: 'tokenless', reason: 'import_failed' }
+      if (!view.record && !imported) {
+        return { answer: { status: 'tokenless', reason: 'import_failed' }, version: view.version }
+      }
     }
 
     let attempted = false
     for (;;) {
       const { record, token, unreadable } = view
-      if (!record) return { status: 'none' }
+      if (!record) return { answer: { status: 'none' }, version: view.version }
       const decision = decideGet(record, {
         now: this.deps.now(),
         minValidity,
@@ -155,7 +204,7 @@ export class ShopSessions implements ShopSessionsRpc {
 
       if (decision.kind === 'call') {
         attempted = true
-        await this.waitBounded(this.runTokenCall(decision.intent, 'interactive', decision.quarantined))
+        await this.waitBounded(this.runTokenCall(decision.intent, 'interactive', decision.quarantined), budget)
         view = await this.load()
         continue
       }
@@ -185,7 +234,7 @@ export class ShopSessions implements ShopSessionsRpc {
         })
       }
       await this.ensureAlarm(view)
-      return answer
+      return { answer, record, version: view.version }
     }
   }
 
@@ -238,6 +287,18 @@ export class ShopSessions implements ShopSessionsRpc {
   private putIssued(tokenFp: string, session: SessionParams): Promise<PutSessionResult> {
     return this.critical(async () => {
       const record = await this.deps.store.get()
+      if (record && isAppToken(record, tokenFp)) {
+        // An app token written back: never stored as the chain. Without its token (invalidateAccessToken after a 401)
+        // the current one is dropped, as reportUnauthorized does; one cached by primary mode is marked invalid.
+        if (!nonEmpty(session.accessToken)) {
+          if (record.tokenFp === tokenFp) {
+            if (!record.tokenInvalid) await this.deps.store.put({ ...record, tokenInvalid: true })
+          } else {
+            await this.dropFallback(record, tokenFp)
+          }
+        }
+        return MERGED
+      }
       if (!record || record.tokenFp !== tokenFp) return IGNORED
       if (!nonEmpty(session.accessToken)) {
         // invalidateAccessToken after an Admin API 401 on a token this object issued.
@@ -279,6 +340,8 @@ export class ShopSessions implements ShopSessionsRpc {
           await this.mergeScope(record, pair.scope)
           return { result: MERGED }
         }
+        // An untagged copy of an app token: it must never become the chain, or the library would be served it.
+        if (isAppToken(record, pair.tokenFp)) return { result: MERGED }
 
         let next: ShopRecord
         let dropped = 0
@@ -369,9 +432,205 @@ export class ShopSessions implements ShopSessionsRpc {
     this.assertShop(input.shop)
     return this.critical(async () => {
       const record = await this.deps.store.get()
+      if (record?.fallback && record.fallback.tokenFp === input.tokenFp) {
+        // A revoked signing key or an uninstall: drop it; an app caller remints after the backoff.
+        await this.dropFallback(record, input.tokenFp)
+        return { status: 'marked' }
+      }
       if (!record || !record.tokenFp || record.tokenFp !== input.tokenFp) return { status: 'ignored_stale' }
       if (!record.tokenInvalid) await this.deps.store.put({ ...record, tokenInvalid: true })
       return { status: 'marked' }
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // App-token fallback (DESIGN.md §6.10)
+
+  /**
+   * The stored app token, or a new one, in place of the chain's answer. If the chain changes meanwhile (an exchange, a
+   * refresh, a destroy), its new answer wins, or stands in for it in turn.
+   */
+  private async fallbackSession(
+    appTokens: AppTokenClient,
+    minValidity: number,
+    budget: Budget,
+    first: ChainAnswer,
+  ): Promise<GetSessionResult> {
+    let chain = first
+    for (let mints = 0; ; mints++) {
+      // Read now, not taken from the chain's answer: a 401 report may have dropped the token since.
+      const record = await this.deps.store.get()
+      if (!record) return chain.answer
+      const stored = await this.servedFallback(appTokens, record, minValidity)
+      if (stored) return stored
+      if (mints >= MAX_MINTS_PER_REQUEST || !this.mayMint(appTokens, record)) return chain.answer
+
+      const minted = await this.waitBounded(this.runMint(appTokens, chain.version), budget)
+      if (minted !== 'joined' && minted?.answer) return minted.answer
+      if (this.version !== chain.version) {
+        chain = await this.chainSession(minValidity, budget)
+        if (!fallbackApplies(chain.answer)) return chain.answer
+      } else if (minted === undefined) {
+        // Out of budget: the mint finishes for the next caller.
+        return chain.answer
+      }
+    }
+  }
+
+  private async servedFallback(
+    appTokens: AppTokenClient,
+    record: ShopRecord,
+    minValidity: number,
+  ): Promise<GetSessionResult | undefined> {
+    const fallback = record.fallback
+    // A token minted with another key goes: that key may be revoked, which ends its tokens.
+    if (!fallback || fallback.kid !== appTokens.kid) return undefined
+    if (!fallbackFresh(fallback, this.deps.now(), minValidity)) return undefined
+    // Sealed under a key since dropped from the keyring: mint a new one.
+    const token = await this.open(fallback.token, 'fallback')
+    return token === undefined ? undefined : this.fallbackAnswer(record, fallback, token)
+  }
+
+  private fallbackAnswer(record: ShopRecord, fallback: FallbackToken, token: string): GetSessionResult {
+    return {
+      status: 'ok',
+      session: strip({
+        shop: this.deps.shop,
+        scope: fallback.scope ?? record.scope,
+        accessToken: token,
+        expires: fallback.expires,
+      }),
+      tokenFp: fallback.tokenFp,
+      source: 'app_token',
+    }
+  }
+
+  private mayMint(appTokens: AppTokenClient, record: ShopRecord): boolean {
+    const now = this.deps.now()
+    return this.mintBackoffUntil <= now && !mintRejected(record, appTokens.kid, now)
+  }
+
+  /** Drops the current app token after a 401, and backs off: a new one may well be refused the same way. */
+  private async dropFallback(record: ShopRecord, tokenFp: string): Promise<void> {
+    if (record.fallback?.tokenFp !== tokenFp) return
+    await this.deps.store.put(without(record, 'fallback'))
+    this.mintBackoffUntil = this.deps.now() + MINT_BACKOFF
+  }
+
+  private runMint(appTokens: AppTokenClient, version: number): Promise<MintResult | 'joined'> {
+    return this.single(
+      () => this.minting,
+      (call) => (this.minting = call),
+      'mint',
+      () => this.mint(appTokens, version),
+    )
+  }
+
+  /**
+   * §6.1 steps 1 and 6 only: no `attemptSince` and no alarm, since a lost mint leaves the chain nothing to recover.
+   * `version` is the chain's: one replaced or destroyed since needs no app token.
+   */
+  private async mint(appTokens: AppTokenClient, version: number): Promise<MintResult> {
+    if (this.version !== version) return { status: 'discarded' }
+
+    const sentAt = this.deps.now()
+    let result: TokenCallResult
+    try {
+      result = await appTokens.mint(this.deps.shop)
+    } catch {
+      result = { outcome: 'transient', sentAt, ambiguous: true, code: 'exception' }
+    }
+
+    // A rejection is stored, so an evicted instance doesn't ask (and report) again; a new chain or a new key lifts it.
+    if (result.outcome !== 'success') return this.mintFailed(appTokens, version, result)
+
+    this.reportMissingExpiresIn(result)
+    const token = await this.seal(result.accessToken, 'fallback')
+    const tokenFp = await fingerprint(result.accessToken)
+    const answer = await this.critical(async (): Promise<GetSessionResult | undefined> => {
+      const record = await this.deps.store.get()
+      // An exchange, a refresh or a destroy landed meanwhile: the chain no longer needs this token.
+      if (!record || this.version !== version) return undefined
+      const lifetime = validSeconds(result.expiresIn) ? result.expiresIn * SECOND : DEFAULT_EXPIRES_IN
+      // Dated from the send: Shopify may return the token it issued earlier that minute, with its original expiry.
+      const obtainedAt = result.sentAt
+      const fallback: FallbackToken = strip({
+        token,
+        tokenFp,
+        expires: obtainedAt + lifetime,
+        scope: nonEmpty(result.scope),
+        kid: appTokens.kid,
+        obtainedAt,
+      })
+      const next = {
+        ...without(record, 'mintRejected'),
+        fallback,
+        appTokenFps: withAppTokenFp(record.appTokenFps, tokenFp),
+      }
+      await this.deps.store.put(next)
+      return this.fallbackAnswer(next, fallback, result.accessToken)
+    })
+    if (!answer) return { status: 'discarded' }
+    this.mintSucceeded()
+    this.log('Serving an application-only token', { shop: this.deps.shop, op: 'mint', kind: 'success', code: 'minted' })
+    return { status: 'success', answer }
+  }
+
+  /**
+   * Holds off the next mint and reports. A transient failure is held in memory; Shopify's rejection is stored on the
+   * existing record with a hold that grows while it repeats. A mint that never left (a key that can't sign) is held in
+   * memory: it says nothing about the shop.
+   */
+  private async mintFailed(
+    appTokens: AppTokenClient,
+    version: number,
+    result: Exclude<TokenCallResult, { outcome: 'success' }>,
+  ): Promise<MintResult> {
+    const rejected = (result.outcome === 'terminal' || result.outcome === 'configuration') && !NOT_SENT.has(result.code)
+    // Reported as terminal whatever Shopify called it: either way the chain stays the answer.
+    const kind = rejected ? 'terminal' : result.outcome
+    const context = this.resultContext('mint', kind, result.code, result)
+
+    if (!rejected) {
+      this.mintBackoffUntil = this.deps.now() + Math.max(MINT_BACKOFF, result.retryAfterMs ?? 0)
+      const key = `${kind}:${result.code}`
+      if (this.mintReported !== key) this.emit('Shopify app token request failed', context)
+      else this.log('Shopify app token request failed', context)
+      this.mintReported = key
+      return { status: 'failed' }
+    }
+
+    const stored = await this.critical(async (): Promise<boolean> => {
+      const record = await this.deps.store.get()
+      if (!record || this.version !== version) return false
+      await this.deps.store.put({
+        ...record,
+        mintRejected: rejectedMint(record.mintRejected, appTokens.kid, this.deps.now()),
+      })
+      return true
+    })
+    // Discarded with the chain it was for: the new chain's own mint reports if it is refused too.
+    if (!stored) {
+      this.log('Shopify app token request failed', context)
+      return { status: 'discarded' }
+    }
+    this.emit('Shopify app token request failed', context)
+    return { status: 'terminal' }
+  }
+
+  private mintSucceeded(): void {
+    this.mintReported = undefined
+    this.mintBackoffUntil = 0
+  }
+
+  private reportMissingExpiresIn(result: Extract<TokenCallResult, { outcome: 'success' }>): void {
+    if (validSeconds(result.expiresIn)) return
+    this.emit('Shopify app token response missing expires_in', {
+      shop: this.deps.shop,
+      op: 'mint',
+      kind: 'success',
+      code: 'missing_fields',
+      requestId: result.requestId,
     })
   }
 
@@ -380,12 +639,28 @@ export class ShopSessions implements ShopSessionsRpc {
 
   /** Starts a token call, or joins the one in flight (the caller re-reads either way). */
   private runTokenCall(intent: TokenIntent, mode: DelayMode, quarantined: boolean): Promise<CallStatus> {
-    if (this.inflight) return this.inflight.then((): CallStatus => 'joined')
-    const call: Promise<CallStatus> = this.tokenCall(intent, mode, quarantined).finally(() => {
-      if (this.inflight === call) this.inflight = undefined
+    return this.single(
+      () => this.inflight,
+      (call) => (this.inflight = call),
+      intent,
+      () => this.tokenCall(intent, mode, quarantined),
+    )
+  }
+
+  /** Starts `run` under `ctx.waitUntil` as the flight `get`/`set` hold, or joins the one already there (`joined`). */
+  private single<T>(
+    get: () => Promise<T | 'joined'> | undefined,
+    set: (call: Promise<T | 'joined'> | undefined) => void,
+    op: string,
+    run: () => Promise<T>,
+  ): Promise<T | 'joined'> {
+    const current = get()
+    if (current) return current.then((): 'joined' => 'joined')
+    const call: Promise<T | 'joined'> = run().finally(() => {
+      if (get() === call) set(undefined)
     })
-    this.inflight = call
-    this.deps.waitUntil(call.catch((error) => this.logError(intent, error)))
+    set(call)
+    this.deps.waitUntil(call.catch((error) => this.logError(op, error)))
     return call
   }
 
@@ -568,7 +843,7 @@ export class ShopSessions implements ShopSessionsRpc {
       const now = this.deps.now()
       // This call's marker goes with its outcome, unless Shopify may have processed one of its attempts. One left by
       // an earlier lost call stays until a success.
-      const record = ownMarker && !firstAmbiguous ? withoutAttempt(stored) : stored
+      const record = ownMarker && !firstAmbiguous ? without(stored, 'attemptSince') : stored
       const untried = (record.alternates ?? []).some((alternate) => !known.has(alternate.fp))
 
       let failure: FailureInput | undefined
@@ -935,14 +1210,15 @@ export class ShopSessions implements ShopSessionsRpc {
     if (scope !== undefined && scope !== record.scope) await this.deps.store.put({ ...record, scope })
   }
 
-  /** Waits for a token call, but no longer than a request can afford. */
-  private async waitBounded(call: Promise<unknown>): Promise<void> {
+  /** Waits for a token call, but no longer than the request's budget allows. `undefined` on timeout or error. */
+  private async waitBounded<T>(call: Promise<T>, budget: Budget): Promise<T | undefined> {
+    const until = (budget.until ??= Date.now() + this.callerWaitMs)
     let timer: ReturnType<typeof setTimeout> | undefined
-    const timeout = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, this.callerWaitMs)
+    const timeout = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), Math.max(0, until - Date.now()))
     })
     try {
-      await Promise.race([call.then(noop, noop), timeout])
+      return await Promise.race([call.catch(() => undefined), timeout])
     } finally {
       clearTimeout(timer)
     }
@@ -1034,9 +1310,4 @@ export class ShopSessions implements ShopSessionsRpc {
 
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : typeof error
-}
-
-function withoutAttempt(record: ShopRecord): ShopRecord {
-  const { attemptSince: _attemptSince, ...rest } = record
-  return rest
 }
