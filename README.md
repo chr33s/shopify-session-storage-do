@@ -58,6 +58,10 @@ it in a private repository and share it here for anyone it helps; see
   callers of the adapter.
 - **Nothing secret is logged or reported:** no tokens, refresh tokens, client
   secret, response bodies or request data.
+- **The app token key, if you configure one, reaches every shop.** Whoever
+  holds it can get a token for every store that installed the app, with no
+  refresh token needed. Leaving `appTokenKey` unset keeps it out of the
+  picture; see [App-token fallback](#app-token-fallback).
 
 Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
@@ -259,6 +263,11 @@ switch (result.status) {
 }
 ```
 
+With the [app-token fallback](#app-token-fallback) on, `ok` can also carry
+`source: 'app_token'`: an application-only token, served while the shop's own
+chain can't produce one. It is used the same way, including
+`reportUnauthorized` on a 401.
+
 - **`minValidityMs`** is how long the token must stay valid; the object clamps
   it to 6–40 minutes (default 6) and refreshes first when needed, making the
   caller wait at most 3 s. Reload between batches for longer jobs.
@@ -271,6 +280,63 @@ switch (result.status) {
   `Symbol.for('@optizio/shopify-session-storage-do')` holding the token's
   fingerprint. It lets the object tell a write-back (a scope update, a 401) from
   a new exchange, and nothing persists it.
+
+### App-token fallback
+
+Optional. When the shop's refresh-token chain can't produce a token (Shopify
+rejected it, an emergency secret revocation, the token endpoint down with no
+token left), `loadOfflineSession` answers with an
+[application-only access token][app-only] instead, so webhooks and jobs keep
+running until the merchant opens the app again. It is minted with a JWT signed
+by your own key, not the client secret, so a revoked secret doesn't stop it.
+
+- Only `loadOfflineSession` gets it. `loadSession` (the library) still sees
+  `needs_reauth` or `tokenless`, so `authenticate.admin` exchanges and heals
+  the chain. A webhook handler's `admin` client comes from `loadSession`, so
+  it doesn't fall back; handlers that should keep working load the token with
+  `loadOfflineSession` instead.
+- It never replaces or resets the chain, even when app code writes it (or an
+  earlier one) back through `storeSession`. It is stored next to the chain,
+  sealed like every token, and reused until it has less than `minValidityMs`
+  left (a token that never lived that long: for the first half of its life).
+  The next exchange or refresh drops it, as do a 401 (`reportUnauthorized`, or
+  the library's own write-back, after which minting waits a minute), a new
+  signing key, and delete.
+- One mint at a time per shop. Mints never hold up refreshes, and a load
+  still waits at most 3 s for token calls in all. A failed mint answers as the
+  chain would: after a transient failure the object waits a minute (or
+  `Retry-After`); after a rejection (a bad or revoked key, an uninstalled
+  shop) it stops for a day, or until the key or the chain changes.
+- Never for a shop without a record: nothing is minted for unknown domains.
+- Shopify allows it for apps with public distribution on stores that
+  installed them.
+
+Setup:
+
+```sh
+# An ES256 key pair (RS256 with 2048–8192 bits works too).
+openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out app-token-key.pem
+# The public JWK to add in the Dev Dashboard (Settings > Credentials > Public keys).
+node -e "const k=require('crypto').createPublicKey(require('fs').readFileSync('app-token-key.pem')).export({format:'jwk'});console.log(JSON.stringify({...k,kid:'app-key-1',alg:'ES256',use:'sig'}))"
+wrangler secret put SHOPIFY_APP_TOKEN_KEY < app-token-key.pem   # per env; escrow it like the keyring
+```
+
+```ts
+export const ShopSessions = createShopSessionsDurableObject<Env>({
+  registry: (env) => ({ kv: env.SESSION }),
+  appTokenKey: (env) =>
+    env.SHOPIFY_APP_TOKEN_KEY ? { kid: 'app-key-1', alg: 'ES256', privateKey: env.SHOPIFY_APP_TOKEN_KEY } : undefined,
+})
+```
+
+A malformed key, or an `appTokenKey(env)` that throws, is reported
+(`app_token_key`, at most hourly per isolate) and turns the fallback off; the
+chain carries on. To rotate the key, add the new public JWK (Shopify allows two), deploy
+the new `kid`, wait an hour for tokens minted under the old one to expire, then
+revoke the old key. If the private key leaks, revoke it in the Dev Dashboard:
+that ends every token minted with it.
+
+[app-only]: https://shopify.dev/docs/apps/build/authentication-authorization/application-only-access-tokens
 
 ### What the library sees
 
@@ -305,18 +371,19 @@ Returns a class (`new (ctx, env)`, extending `DurableObject`) to export from
 the Worker entry. Every option that takes `env` is read from the host Worker's
 bindings, since a Durable Object receives nothing else.
 
-| Option                   | Default                               | Notes                                                                                        |
-| ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `registry(env)`          | required                              | `{ kv, prefix? }`: KV namespace for registry markers; `prefix` defaults to `'shop-session:'` |
-| `apiKey(env)`            | `env.SHOPIFY_API_KEY`                 | throws when empty                                                                            |
-| `apiSecretKey(env)`      | `env.SHOPIFY_API_SECRET`              | throws when empty                                                                            |
-| `encryptionKeys(env)`    | `env.SHOPIFY_SESSION_ENCRYPTION_KEYS` | malformed: every call throws                                                                 |
-| `legacyKv(env)`          | none                                  | KV holding `offline_<shop>` sessions from `KVSessionStorage`; `undefined` turns import off   |
-| `migrateLegacy(env)`     | `false`                               | upgrade legacy tokens; read each time an alarm runs                                          |
-| `legacyCutoff`           | `Date.UTC(2027, 0, 1)`                | from then on legacy tokens aren't served and legacy exchanges are ignored                    |
-| `allowMyshopifyIo`       | `false`                               | accept `*.myshopify.io`; must match the adapter and backfill                                 |
-| `report(error, context)` | none                                  | receives a `ShopSessionError`; the log line is written either way                            |
-| `fetch`, `now`           | globals                               | for tests                                                                                    |
+| Option                   | Default                               | Notes                                                                                                                     |
+| ------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `registry(env)`          | required                              | `{ kv, prefix? }`: KV namespace for registry markers; `prefix` defaults to `'shop-session:'`                              |
+| `apiKey(env)`            | `env.SHOPIFY_API_KEY`                 | throws when empty                                                                                                         |
+| `apiSecretKey(env)`      | `env.SHOPIFY_API_SECRET`              | throws when empty                                                                                                         |
+| `encryptionKeys(env)`    | `env.SHOPIFY_SESSION_ENCRYPTION_KEYS` | malformed: every call throws                                                                                              |
+| `legacyKv(env)`          | none                                  | KV holding `offline_<shop>` sessions from `KVSessionStorage`; `undefined` turns import off                                |
+| `migrateLegacy(env)`     | `false`                               | upgrade legacy tokens; read each time an alarm runs                                                                       |
+| `legacyCutoff`           | `Date.UTC(2027, 0, 1)`                | from then on legacy tokens aren't served and legacy exchanges are ignored                                                 |
+| `appTokenKey(env)`       | none                                  | `{ kid, alg: 'ES256' \| 'RS256', privateKey }` (PKCS#8 PEM or private JWK); see [App-token fallback](#app-token-fallback) |
+| `allowMyshopifyIo`       | `false`                               | accept `*.myshopify.io`; must match the adapter and backfill                                                              |
+| `report(error, context)` | none                                  | receives a `ShopSessionError`; the log line is written either way                                                         |
+| `fetch`, `now`           | globals                               | for tests                                                                                                                 |
 
 The object's RPC methods (`getSession`, `putSession`, `reportUnauthorized`,
 `destroy`, `importLegacy`, `describe`) take a canonical `shop` that must match
@@ -330,16 +397,16 @@ the object's name. Go through the adapter rather than calling them directly.
 | `locationHint`     | `'enam'` | eastern North America; the first access fixes an object's location, so use one value at every call site |
 | `allowMyshopifyIo` | `false`  | must match the Durable Object                                                                           |
 
-| Method                                         | Does                                                                                           |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `loadSession(id)`, `storeSession(session)`     | the library's interface (offline ids `offline_<shop>` only)                                    |
-| `loadOfflineSession(shop, { minValidityMs? })` | `ok` / `none` / `needs_reauth` (`since`, `reason`) / `unavailable` (`reason`, `retryAfterMs?`) |
-| `reportUnauthorized(session)`                  | background 401 on an issued session                                                            |
-| `deleteShop(shop, { uninstalledAt? })`         | `deleted` or `kept_newer_install`                                                              |
-| `rollover(shop, { obtainedBefore })`           | replace the shop's credentials now, see [Rolling over](#rolling-over-credentials)              |
-| `describe(shop)`                               | non-secret status, see [Debugging](#debugging-with-describe)                                   |
-| `deleteSession(id)`, `deleteSessions(ids)`     | delete without the reinstall guard                                                             |
-| `findSessionsByShop(shop)`                     | `[session]` when it has an access token, else `[]`                                             |
+| Method                                         | Does                                                                                                                    |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `loadSession(id)`, `storeSession(session)`     | the library's interface (offline ids `offline_<shop>` only)                                                             |
+| `loadOfflineSession(shop, { minValidityMs? })` | `ok` (`source?: 'app_token'`) / `none` / `needs_reauth` (`since`, `reason`) / `unavailable` (`reason`, `retryAfterMs?`) |
+| `reportUnauthorized(session)`                  | background 401 on an issued session                                                                                     |
+| `deleteShop(shop, { uninstalledAt? })`         | `deleted` or `kept_newer_install`                                                                                       |
+| `rollover(shop, { obtainedBefore })`           | replace the shop's credentials now, see [Rolling over](#rolling-over-credentials)                                       |
+| `describe(shop)`                               | non-secret status, see [Debugging](#debugging-with-describe)                                                            |
+| `deleteSession(id)`, `deleteSessions(ids)`     | delete without the reinstall guard                                                                                      |
+| `findSessionsByShop(shop)`                     | `[session]` when it has an access token, else `[]`                                                                      |
 
 RPC infrastructure errors marked retryable are retried once with a fresh stub.
 
@@ -389,6 +456,7 @@ Returns `{ status, attempted, outcomes, pass? }`. `status` is `idle`,
 | `SHOPIFY_API_KEY`                 | var    | the app's client id                                              |
 | `SHOPIFY_API_SECRET`              | secret | the app's client secret                                          |
 | `SHOPIFY_SESSION_ENCRYPTION_KEYS` | secret | comma-separated base64 keys of 32 bytes, distinct, current first |
+| `SHOPIFY_APP_TOKEN_KEY`           | secret | optional; any name, read by your `appTokenKey(env)`              |
 
 ## Operations
 
@@ -583,6 +651,8 @@ use.
 - [ ] Nothing persists an access token (job rows, queue messages): pass the
       shop and load the token when the work runs.
 - [ ] Background 401s call `reportUnauthorized`.
+- [ ] With `appTokenKey`: the public JWK is registered in the Dev Dashboard for
+      the `kid` deployed, and the private key is a secret, escrowed.
 - [ ] Webhooks that write sessions, such as `APP_SCOPES_UPDATE`, call
       `shopify.sessionStorage.storeSession`, not a new `KVSessionStorage`
       (which would write the token back to KV in plaintext).
@@ -604,7 +674,9 @@ use.
 - **One client secret at a time.** The object always uses
   `SHOPIFY_API_SECRET`; a planned rotation is a deploy followed by a
   [rollover](#rolling-over-credentials). Accepting webhooks and session tokens
-  signed with either secret during the overlap is up to the app.
+  signed with either secret during the overlap is up to the app. Shops whose
+  rollover is rejected keep background work running on the
+  [app-token fallback](#app-token-fallback), if configured.
 - **Some fleet sweeps are deferred:** re-counting or re-placing every object,
   and a circuit breaker for the backfill. None needs a change to stored data.
 - **No caching in the isolate.** Every load is an RPC to the shop's object.

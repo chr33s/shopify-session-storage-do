@@ -30,6 +30,7 @@ export type { ShopOptions } from './shop.js'
 
 export { DEFAULT_LOCATION_HINT, DEFAULT_REGISTRY_PREFIX, ISSUED, ShopSessionError } from './types.js'
 export type {
+  AppTokenKey,
   DescribeInput,
   DestroyInput,
   DestroyResult,

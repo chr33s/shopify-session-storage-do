@@ -2,12 +2,13 @@
 
 import { createShopSessionsDurableObject } from '../../src/durable-object.js'
 import type { ShopSessionsDurableObject } from '../../src/durable-object.js'
-import { clock, fakeShopify } from './fake-shopify.js'
+import { APP_KEY_ID, APP_PRIVATE_JWK, clock, fakeShopify } from './fake-shopify.js'
 
 export type Env = {
   SHOP_SESSIONS: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
   BROKEN_KEYRING: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
   NO_CREDENTIALS: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
+  APP_TOKENS: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
   REGISTRY: KVNamespace
   LEGACY: KVNamespace
   SHOPIFY_API_KEY: string
@@ -26,6 +27,12 @@ export const TestShopSessions = createShopSessionsDurableObject<Env>({
   registry: (env) => ({ kv: env.REGISTRY }),
   legacyKv: (env) => env.LEGACY,
   migrateLegacy: () => true,
+  ...testing,
+})
+
+export const AppTokenShopSessions = createShopSessionsDurableObject<Env>({
+  registry: (env) => ({ kv: env.REGISTRY }),
+  appTokenKey: () => ({ kid: APP_KEY_ID, alg: 'ES256', privateKey: APP_PRIVATE_JWK }),
   ...testing,
 })
 

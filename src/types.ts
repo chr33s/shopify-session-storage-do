@@ -21,7 +21,7 @@ export const LEGACY_SHOP_LIST_PREFIX = 'shop:'
 /** AES-256-GCM ciphertext with the id of the key that sealed it. AAD is `${shop}|${field}`. */
 export type Sealed = { kid: string; iv: Uint8Array; ct: Uint8Array }
 
-export type SealedField = 'token' | 'refresh' | 'alternate'
+export type SealedField = 'token' | 'refresh' | 'alternate' | 'fallback'
 
 export type TokenSource = 'exchange' | 'refresh' | 'migrate' | 'import' | 'legacy_exchange'
 
@@ -70,6 +70,33 @@ export type ShopRecord = {
     /** `${kind}:${code}` last reported, so each transition is reported once. */
     reported?: string
   }
+  /**
+   * An application-only access token minted while the chain can't produce one (DESIGN.md §6.10). Lives next to the
+   * chain and never changes it; every write that replaces the chain's tokens drops it.
+   */
+  fallback?: FallbackToken
+  /**
+   * Shopify rejected a mint for this chain under this signing key: no mint until the key or the chain changes (every
+   * write that replaces the chain's tokens drops it), or a day passes.
+   */
+  mintRejected?: { kid: string; since: number }
+  /**
+   * Fingerprints of the app tokens minted for this shop, newest first (at most 5). Kept across chain replacements, so
+   * a copy of an old app token written back is never taken for an exchange.
+   */
+  appTokenFps?: string[]
+}
+
+export type FallbackToken = {
+  token: Sealed
+  tokenFp: string
+  /** ms epoch. */
+  expires: number
+  scope?: string
+  /** `kid` of the signing key whose assertion minted it. */
+  kid: string
+  /** When the mint was sent: with `expires`, the token's lifetime. */
+  obtainedAt: number
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +126,13 @@ export type GetSessionInput = {
 export type TokenlessReason = 'token_endpoint' | 'unreadable' | 'legacy_unusable' | 'import_failed'
 
 export type GetSessionResult =
-  | { status: 'ok'; session: { shop: string; scope?: string; accessToken: string; expires?: number }; tokenFp: string }
+  | {
+      status: 'ok'
+      session: { shop: string; scope?: string; accessToken: string; expires?: number }
+      tokenFp: string
+      /** Set when the token is an application-only fallback (only for caller 'app'). */
+      source?: 'app_token'
+    }
   | { status: 'none' }
   | { status: 'needs_reauth'; since: number; reason: NeedsReauthReason }
   | { status: 'tokenless'; reason: TokenlessReason; scope?: string; expires?: number; retryAfterMs?: number }
@@ -154,6 +187,10 @@ export type ShopSessionStatus = {
   kids?: string[]
   needsReauth?: { since: number; reason: NeedsReauthReason }
   failures?: { count: number; kind: FailureKind; code: string; since: number; retryAt: number; ambiguous: boolean }
+  /** The stored application-only fallback token, if any (it may have expired). */
+  fallback?: { kid: string; expires: number }
+  /** A mint Shopify rejected under this signing key; none is tried until the key or the chain changes. */
+  mintRejected?: { kid: string; since: number }
   nextAlarmAt?: number | null
 }
 
@@ -247,6 +284,25 @@ export interface TokenClient {
   migrate(shop: string, legacyToken: string): Promise<TokenCallResult>
 }
 
+/**
+ * A private key whose public JWK is registered on the app in the Dev Dashboard. Signs the client assertions of the
+ * application-only token grant.
+ */
+export type AppTokenKey = {
+  /** The `kid` of the registered public JWK. */
+  kid: string
+  /** PKCS#8 PEM, or a private JWK. */
+  privateKey: string | JsonWebKey
+  alg: 'ES256' | 'RS256'
+}
+
+/** Mints application-only access tokens (client credentials grant with a signed client assertion). */
+export interface AppTokenClient {
+  /** `kid` of the signing key. */
+  readonly kid: string
+  mint(shop: string): Promise<TokenCallResult>
+}
+
 export interface Keyring {
   readonly currentKid: string
   seal(plaintext: string, aad: string): Promise<Sealed>
@@ -256,7 +312,7 @@ export interface Keyring {
 
 export type ReportContext = {
   shop: string
-  /** e.g. 'refresh', 'migrate', 'import', 'alarm', 'unreadable', 'put', 'config' */
+  /** e.g. 'refresh', 'migrate', 'mint', 'import', 'alarm', 'unreadable', 'put', 'config' */
   op: string
   kind: string
   code: string
@@ -280,6 +336,8 @@ export type CoreDeps = {
   store: RecordStore
   alarm: AlarmControl
   tokens: TokenClient
+  /** Absent when no app token key is configured: no fallback. */
+  appTokens?: AppTokenClient
   keyring: Keyring
   /** Fingerprint of apiKey + apiSecretKey (see crypto.credentialFingerprint). */
   credFp: string

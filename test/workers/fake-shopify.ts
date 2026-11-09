@@ -7,6 +7,9 @@
 //   shop. Exchanges themselves aren't sent over HTTP: tests hand the pair to `putSession`.
 // - Migrating a legacy token retires it at once (it is no longer accepted anywhere else); repeating the identical
 //   request returns the same pair.
+// - The application-only grant (client credentials with a client assertion) checks the assertion against the
+//   registered public keys, accepts each `jti` once, and mints a token without a refresh token for an installed shop.
+//   It doesn't use the client secret, so it keeps working after `revokeSecret()`.
 // - Scripted responses, a fixed delay and holds simulate failures, slow calls and lost responses.
 
 export const API_KEY = 'test-api-key'
@@ -14,7 +17,19 @@ export const API_SECRET = 'test-api-secret'
 export const ACCESS_TOKEN_LIFETIME_S = 3600
 export const REFRESH_TOKEN_LIFETIME_S = 90 * 86_400
 
+export const APP_TOKEN_LIFETIME_S = 3599
+/** The test app's signing key (ES256). Test-only: its public half is what the fake registers. */
+export const APP_KEY_ID = 'test-app-key-1'
+export const APP_PRIVATE_JWK: JsonWebKey = {
+  kty: 'EC',
+  crv: 'P-256',
+  x: 'yYYnfddrOmjQIkcOFk-EmMnZWaJc8Ghe8IsM6ArKEZw',
+  y: 'LilmZ5f5qPKg1GYkrvta11fzoT4VRid8jLsXMRagwhY',
+  d: 'N4KnrXbfuZ-HwksQ8ThS2tiUAyQwBx9vD_REg47b5Kc',
+}
+
 const TOKEN_PATH = '/admin/oauth/access_token'
+const JWT_BEARER = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
 const TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange'
 const OFFLINE_ACCESS_TOKEN = 'urn:shopify:params:oauth:token-type:offline-access-token'
 
@@ -26,7 +41,7 @@ export type Pair = {
   refreshTokenExpiresIn: number
 }
 
-export type Grant = 'refresh' | 'migrate'
+export type Grant = 'refresh' | 'migrate' | 'mint'
 
 export type Call = { shop: string; grant: Grant; presented: string; status: number }
 
@@ -72,9 +87,19 @@ export class FakeShopify {
   private readonly scripts = new Map<string, Scripted[]>()
   private readonly holds = new Map<string, Hold[]>()
   private readonly minted = new Map<string, Pair[]>()
+  private secret = API_SECRET
+  private readonly uninstalled = new Set<string>()
+  private readonly revokedKeys = new Set<string>()
+  private readonly jtis = new Set<string>()
+  private readonly appTokens = new Map<string, string[]>()
 
   reset(): void {
     this.calls.length = 0
+    this.secret = API_SECRET
+    this.uninstalled.clear()
+    this.revokedKeys.clear()
+    this.jtis.clear()
+    this.appTokens.clear()
     this.delayMs = 0
     this.scope = 'read_products,write_discounts'
     this.refreshTokens.clear()
@@ -88,6 +113,27 @@ export class FakeShopify {
   exchange(shop: string): Pair {
     this.retireAll(shop)
     return this.mint(shop)
+  }
+
+  /** An emergency revocation: refreshes and migrations sent with the secret are refused. */
+  revokeSecret(): void {
+    this.secret = 'revoked'
+  }
+
+  /** The merchant uninstalls the app: every token of the shop stops working. */
+  uninstall(shop: string): void {
+    this.retireAll(shop)
+    this.uninstalled.add(shop)
+  }
+
+  /** Removes a public key from the app: assertions signed with it are rejected. */
+  revokeKey(kid: string): void {
+    this.revokedKeys.add(kid)
+  }
+
+  /** Application-only tokens issued for the shop, oldest first. */
+  appTokensFor(shop: string): string[] {
+    return [...(this.appTokens.get(shop) ?? [])]
   }
 
   /** A legacy non-expiring offline token, as the old OAuth flow issued. */
@@ -137,8 +183,11 @@ export class FakeShopify {
     if (url.protocol !== 'https:' || url.pathname !== TOKEN_PATH || request.method !== 'POST') {
       return json(404, { errors: 'Not Found' })
     }
+    if (request.headers.get('content-type') === 'application/x-www-form-urlencoded') {
+      return this.clientCredentials(shop, new URLSearchParams(await request.text()))
+    }
     const body = (await request.json()) as Record<string, unknown>
-    if (body['client_id'] !== API_KEY || body['client_secret'] !== API_SECRET) {
+    if (body['client_id'] !== API_KEY || body['client_secret'] !== this.secret) {
       return json(400, { error: 'invalid_client' })
     }
     let grant: Grant
@@ -170,7 +219,78 @@ export class FakeShopify {
       response = scripted ? toResponse(scripted) : processed
     }
     call.status = response.status
+    return this.respond(shop, response)
+  }
 
+  private async clientCredentials(shop: string, form: URLSearchParams): Promise<Response> {
+    const call: Call = { shop, grant: 'mint', presented: form.get('client_assertion') ?? '', status: 0 }
+    this.calls.push(call)
+    const scripted = this.scripts.get(shop)?.shift()
+    const response = scripted ? toResponse(scripted) : await this.mintAppToken(shop, form)
+    call.status = response.status
+    return this.respond(shop, response)
+  }
+
+  private async mintAppToken(shop: string, form: URLSearchParams): Promise<Response> {
+    const keys = form
+      .toString()
+      .split('&')
+      .map((pair) => pair.split('=')[0])
+      .sort()
+      .join(',')
+    if (
+      keys !== 'client_assertion,client_assertion_type,client_id,grant_type' ||
+      form.get('grant_type') !== 'client_credentials' ||
+      form.get('client_assertion_type') !== JWT_BEARER ||
+      form.get('client_id') !== API_KEY
+    ) {
+      return json(400, { error: 'invalid_request' })
+    }
+    if (!(await this.validAssertion(shop, form.get('client_assertion') ?? ''))) {
+      return json(401, { error: 'invalid_client' })
+    }
+    if (this.uninstalled.has(shop) || !this.minted.has(shop)) return json(401, { error: 'invalid_client' })
+    const token = `shpat_app_${++this.counter}_${random()}`
+    this.appTokens.set(shop, [...(this.appTokens.get(shop) ?? []), token])
+    return json(200, { access_token: token, scope: this.scope, expires_in: APP_TOKEN_LIFETIME_S })
+  }
+
+  private async validAssertion(shop: string, jwt: string): Promise<boolean> {
+    const [header, claims, signature] = jwt.split('.')
+    if (!header || !claims || !signature) return false
+    const h = JSON.parse(decode(header)) as Record<string, unknown>
+    const c = JSON.parse(decode(claims)) as Record<string, unknown>
+    if (h['alg'] !== 'ES256' || h['kid'] !== APP_KEY_ID || this.revokedKeys.has(APP_KEY_ID)) return false
+    const { d: _d, ...publicJwk } = APP_PRIVATE_JWK
+    const key = await crypto.subtle.importKey('jwk', publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, [
+      'verify',
+    ])
+    const verified = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      bytes(signature),
+      new TextEncoder().encode(`${header}.${claims}`),
+    )
+    const iat = c['iat']
+    const exp = c['exp']
+    const jti = c['jti']
+    const now = Math.floor(clock.now() / 1000)
+    const valid =
+      verified &&
+      c['iss'] === API_KEY &&
+      c['sub'] === API_KEY &&
+      c['aud'] === `https://${shop}${TOKEN_PATH}` &&
+      typeof iat === 'number' &&
+      typeof exp === 'number' &&
+      exp > now &&
+      exp - iat <= 300 &&
+      typeof jti === 'string' &&
+      !this.jtis.has(jti)
+    if (valid) this.jtis.add(jti)
+    return valid
+  }
+
+  private async respond(shop: string, response: Response): Promise<Response> {
     const hold = this.holds.get(shop)?.shift()
     if (hold) {
       hold.reached = true
@@ -231,6 +351,14 @@ function success(pair: Pair): Response {
     refresh_token: pair.refreshToken,
     refresh_token_expires_in: pair.refreshTokenExpiresIn,
   })
+}
+
+function decode(segment: string): string {
+  return new TextDecoder().decode(bytes(segment))
+}
+
+function bytes(segment: string): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from(atob(segment.replace(/-/g, '+').replace(/_/g, '/')), (char) => char.charCodeAt(0))
 }
 
 function toResponse(scripted: Scripted): Response {

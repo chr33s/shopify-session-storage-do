@@ -5,6 +5,8 @@
 import { canonicalShop } from '../shop.js'
 import type {
   FailureKind,
+  FallbackToken,
+  GetSessionResult,
   NeedsReauthReason,
   Sealed,
   ShopRecord,
@@ -44,6 +46,11 @@ export const INTERACTIVE_BACKOFF_MAX = 2 * MINUTE
 export const ALARM_BACKOFF = [MINUTE, 5 * MINUTE, 30 * MINUTE, 2 * HOUR, 6 * HOUR] as const
 export const LONG_BACKOFF = 6 * HOUR
 export const LONG_BACKOFF_AFTER = 7 * DAY
+/** After a mint that may succeed if tried again (transient, shop unavailable), this instance waits at least this. */
+export const MINT_BACKOFF = MINUTE
+/** A rejected mint is tried again after this even under the same key and chain. */
+export const MINT_REJECTED_RECHECK = DAY
+export const MAX_APP_TOKEN_FPS = 5
 
 export type TokenIntent = 'refresh' | 'migrate'
 export type DelayMode = 'interactive' | 'alarm'
@@ -155,7 +162,54 @@ export function kidsOf(record: ShopRecord): string[] {
   if (record.token) kids.add(record.token.kid)
   if (record.refresh) kids.add(record.refresh.kid)
   for (const alternate of record.alternates ?? []) kids.add(alternate.refresh.kid)
+  if (record.fallback) kids.add(record.fallback.token.kid)
   return [...kids]
+}
+
+// ---------------------------------------------------------------------------
+// App-token fallback (DESIGN.md §6.10)
+
+/**
+ * The chain's answers an application-only token stands in for: credentials rejected or missing, or the token endpoint
+ * unavailable with no token to serve. Storage faults (unreadable, legacy unusable, import failed) are not credential
+ * faults and keep their answer.
+ */
+export function fallbackApplies(answer: GetSessionResult): boolean {
+  return answer.status === 'needs_reauth' || (answer.status === 'tokenless' && answer.reason === 'token_endpoint')
+}
+
+/**
+ * The app token is good for `minValidity` (already clamped) more. A token that never lived that long counts as fresh
+ * for the first half of its life, or a short-lived token would be minted on every request and never served.
+ */
+export function fallbackFresh(fallback: FallbackToken, now: number, minValidity: number): boolean {
+  const halfLife = (fallback.expires - fallback.obtainedAt) / 2
+  return fallback.expires - now > Math.min(minValidity, halfLife)
+}
+
+/** `fp` is an app token minted for this shop, current or not. */
+export function isAppToken(record: ShopRecord | undefined, fp: string): boolean {
+  return record?.appTokenFps?.includes(fp) === true
+}
+
+/** The app token fingerprints with `fp` added, newest first. */
+export function withAppTokenFp(fps: readonly string[] | undefined, fp: string): string[] {
+  return [fp, ...(fps ?? []).filter((known) => known !== fp)].slice(0, MAX_APP_TOKEN_FPS)
+}
+
+/** Shopify rejected a mint under this signing key, for this chain, within the last day. */
+export function mintRejected(record: ShopRecord, kid: string, now: number): boolean {
+  const rejected = record.mintRejected
+  return rejected !== undefined && rejected.kid === kid && now < rejected.since + MINT_REJECTED_RECHECK
+}
+
+type OptionalField = { [K in keyof ShopRecord]-?: undefined extends ShopRecord[K] ? K : never }[keyof ShopRecord]
+
+/** The record without one optional field. */
+export function without(record: ShopRecord, field: OptionalField): ShopRecord {
+  const copy: Partial<ShopRecord> = { ...record }
+  delete copy[field]
+  return copy as ShopRecord
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +369,8 @@ export function describeRecord(
       retryAt: f.retryAt,
       ambiguous: f.ambiguousSince !== undefined,
     },
+    fallback: record.fallback && { kid: record.fallback.kid, expires: record.fallback.expires },
+    mintRejected: record.mintRejected && { kid: record.mintRejected.kid, since: record.mintRejected.since },
     nextAlarmAt: nextAlarm,
   })
 }
@@ -428,6 +484,7 @@ export function exchangeRecord(
     pairObtainedAt: now,
     chainOriginExpires: pair.expires,
     alternates,
+    appTokenFps: prev?.appTokenFps,
   })
 }
 
@@ -476,6 +533,7 @@ export function successRecord(prev: ShopRecord, s: SuccessInput, now: number): S
     source: s.intent,
     pairObtainedAt: now,
     chainOriginExpires: s.intent === 'migrate' ? expires : prev.chainOriginExpires,
+    appTokenFps: prev.appTokenFps,
   })
 }
 

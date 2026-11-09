@@ -10,12 +10,18 @@
       { "name": "SHOP_SESSIONS", "class_name": "TestShopSessions" },
       { "name": "BROKEN_KEYRING", "class_name": "BrokenKeyringShopSessions" },
       { "name": "NO_CREDENTIALS", "class_name": "NoCredentialsShopSessions" },
+      { "name": "APP_TOKENS", "class_name": "AppTokenShopSessions" },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["TestShopSessions", "BrokenKeyringShopSessions", "NoCredentialsShopSessions"],
+      "new_sqlite_classes": [
+        "TestShopSessions",
+        "BrokenKeyringShopSessions",
+        "NoCredentialsShopSessions",
+        "AppTokenShopSessions",
+      ],
     },
   ],
   "kv_namespaces": [

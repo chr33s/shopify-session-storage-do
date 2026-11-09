@@ -3,16 +3,18 @@
 
 import { DurableObject } from 'cloudflare:workers'
 
+import { AppTokenKeyError, createAssertionSigner } from './app-token.js'
 import { HOUR, alarmErrorDelay } from './core/record.js'
 import { ShopSessions } from './core/shop-sessions.js'
 import { KeyringError, createKeyring } from './crypto.js'
 import { credentialFingerprint } from './fingerprint.js'
 import { canonicalShop } from './shop.js'
-import { createTokenClient } from './token-client.js'
+import { createAppTokenClient, createTokenClient } from './token-client.js'
 import { DEFAULT_REGISTRY_PREFIX, ShopSessionError } from './types.js'
 import type {
   AlarmControl,
   AlarmErrors,
+  AppTokenKey,
   CoreDeps,
   DescribeInput,
   DestroyInput,
@@ -36,7 +38,7 @@ import type {
 } from './types.js'
 
 export { ShopSessionError } from './types.js'
-export type { ReportContext, ShopSessionsRpc } from './types.js'
+export type { AppTokenKey, ReportContext, ShopSessionsRpc } from './types.js'
 
 export type ShopSessionsDurableObjectOptions<Env> = {
   /** The KV namespace for installed-shop markers. Prefix defaults to `shop-session:`. */
@@ -51,6 +53,12 @@ export type ShopSessionsDurableObjectOptions<Env> = {
   legacyKv?: (env: Env) => KVNamespaceLike | undefined
   /** Whether the alarm upgrades legacy tokens to expiring ones. Read every time it is needed; default false. */
   migrateLegacy?: (env: Env) => boolean
+  /**
+   * The private key for application-only tokens, whose public JWK is registered on the app. When set,
+   * `loadOfflineSession` answers with an app token while the shop's refresh-token chain can't produce one. Read when
+   * the instance starts; undefined turns the fallback off.
+   */
+  appTokenKey?: (env: Env) => AppTokenKey | undefined
   /** When legacy tokens stop being served (ms epoch). Defaults to 2027-01-01T00:00:00Z. */
   legacyCutoff?: number
   /** Accept `*.myshopify.io` shops. Must match the adapter's setting. */
@@ -77,6 +85,8 @@ const RECORD_KEY = 'record'
 /** The alarm handler's error state (AlarmErrors), shared by the shell's and the core's catch-alls. */
 const ALARM_ERROR_KEY = 'alarm-error'
 const DEFAULT_LEGACY_CUTOFF = Date.UTC(2027, 0, 1)
+/** When this isolate last reported a broken app token key (see reportAppTokenKey). */
+let appTokenKeyReportedAt = -Infinity
 
 /**
  * The Durable Object class to export from the Worker (and bind as the `ShopSessions` namespace). Wrap it with
@@ -250,14 +260,21 @@ class Shell<Env> {
       throw error
     }
     const now = this.now.bind(this)
-    const tokens = createTokenClient({
-      apiKey,
-      apiSecretKey,
-      fetch: options.fetch,
-      now,
-      allowMyshopifyIo: options.allowMyshopifyIo === true,
-    })
+    const http = { apiKey, fetch: options.fetch, now, allowMyshopifyIo: options.allowMyshopifyIo === true }
+    const tokens = createTokenClient({ ...http, apiSecretKey })
     const credFp = await credentialFingerprint(apiKey, apiSecretKey)
+    let appTokens: CoreDeps['appTokens']
+    try {
+      const appTokenKey = options.appTokenKey?.(env)
+      if (appTokenKey !== undefined) {
+        appTokens = createAppTokenClient({ ...http, signer: await createAssertionSigner(apiKey, appTokenKey) })
+      }
+    } catch (error) {
+      // The fallback is optional: a broken key, or an appTokenKey(env) that throws, turns it off but must not take the
+      // chain down. Key errors never contain key material; anything else is named by its type only.
+      const reason = error instanceof AppTokenKeyError ? error.message : `appTokenKey(env) threw ${errorName(error)}`
+      this.reportAppTokenKey(shop, reason)
+    }
 
     // The object is named after its shop; a record for another shop means it was addressed wrongly once already.
     const existing = await ctx.storage.get<ShopRecord>(RECORD_KEY)
@@ -290,6 +307,7 @@ class Shell<Env> {
       store,
       alarm,
       tokens,
+      appTokens,
       keyring,
       credFp,
       registry: { kv: registry.kv, prefix: registry.prefix ?? DEFAULT_REGISTRY_PREFIX },
@@ -308,6 +326,20 @@ class Shell<Env> {
 
   private now(): number {
     return this.options.now ? this.options.now() : Date.now()
+  }
+
+  /** Every object in the isolate builds with the same key: report it at most hourly per isolate, log it otherwise. */
+  private reportAppTokenKey(shop: string, reason: string): void {
+    const error = new ShopSessionError(`ShopSessions: ${reason}; the app-token fallback is off`, {
+      shop,
+      op: 'config',
+      kind: 'configuration',
+      code: 'app_token_key',
+    })
+    const now = this.now()
+    if (now - appTokenKeyReportedAt < HOUR) return log(error)
+    appTokenKeyReportedAt = now
+    this.emit(error)
   }
 
   private shopOptions() {

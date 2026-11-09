@@ -28,6 +28,8 @@ Goals
 - Tokens are encrypted at rest (AES-256-GCM, rotatable keyring). An unreadable
   record degrades to a token exchange, not an outage.
 - A registry of installed shops (KV markers) for fleet listing.
+- Optionally, an application-only token for app callers while the chain can't
+  produce one (§6.10).
 
 Non-goals (v1)
 - Online sessions (`storeSession` of one throws; `loadSession` of an online id
@@ -80,6 +82,17 @@ Shopify
   refresh tokens issued under it still refresh with the new secret is
   undocumented (to be found by rehearsal). Shopify publishes no rate limit or
   pacing for the token endpoint.
+- Application-only tokens ([docs][app-only]): `client_credentials` with a JWT
+  `client_assertion` (ES256 or RS256; `iss` = `sub` = client id, `aud` the
+  shop's token URL, `exp` ≤ 300 s after `iat`, each `jti` accepted once per
+  app), form-encoded, no client secret. Public-distribution apps only, on
+  stores that installed them. The token lasts ≤ 1 h, has no refresh token,
+  carries every granted scope, and may be the one issued earlier that minute.
+  Revoking the secret doesn't affect it; revoking its public key (at most two
+  are active) ends it, as does an uninstall. Token exchange and refresh accept
+  only the client secret. No documented error codes or rate limit.
+
+[app-only]: https://shopify.dev/docs/apps/build/authentication-authorization/application-only-access-tokens
 
 Cloudflare
 - `fetch()` (and, conservatively, `crypto.subtle`) awaits let other events
@@ -105,6 +118,7 @@ Source
 - `src/shop.ts` canonical shop domains.
 - `src/crypto.ts` keyring, seal/open, fingerprints, credential fingerprint.
 - `src/token-client.ts` Shopify OAuth calls and classification.
+- `src/app-token.ts` client assertions for the application-only grant.
 - `src/core/record.ts` record type, pure merge rules, schedule, backoff.
 - `src/core/shop-sessions.ts` orchestrator (injected storage/alarm/clock/KV/
   token client/crypto; Node-testable).
@@ -120,7 +134,7 @@ Source
 new DurableObjectSessionStorage({ namespace, locationHint = 'enam', allowMyshopifyIo = false })
 loadSession(id) / storeSession(session) / deleteSession(id) / deleteSessions(ids) / findSessionsByShop(shop)
 loadOfflineSession(shop, { minValidityMs? }): Promise<
-  | { status: 'ok', session } | { status: 'none' }
+  | { status: 'ok', session, source?: 'app_token' } | { status: 'none' }
   | { status: 'needs_reauth', since: Date, reason }
   | { status: 'unavailable', reason: 'token_endpoint' | 'unreadable' | 'legacy_unusable' | 'import_failed', retryAfterMs? }>
 reportUnauthorized(session): Promise<void>        // background 401 on an issued session
@@ -158,6 +172,7 @@ createShopSessionsDurableObject<Env>({
   encryptionKeys?(env)                                 // default env.SHOPIFY_SESSION_ENCRYPTION_KEYS
   legacyKv?(env): KVNamespace | undefined              // app gates per env, e.g. SHOP_SESSIONS_LEGACY_IMPORT === 'on'
   migrateLegacy?(env): boolean                         // default false; read when the alarm runs
+  appTokenKey?(env): { kid, alg: 'ES256' | 'RS256', privateKey: PEM | JWK } | undefined   // §6.10
   legacyCutoff?: number                                // default Date.UTC(2027, 0, 1)
   allowMyshopifyIo?: boolean
   report?(error, context): void
@@ -208,6 +223,9 @@ type ShopRecord = {
   attemptSince?: number                    // send time of the earliest token call whose outcome isn't stored
   failures?: { count: number; kind: 'transient' | 'shop_unavailable' | 'configuration'; code: string
                since: number; retryAt: number; ambiguousSince?: number; credFp: string; reported?: string }
+  fallback?: { token: Sealed; tokenFp: string; expires: number; scope?: string; kid: string; obtainedAt: number }   // §6.10
+  mintRejected?: { kid: string; since: number }                                                                       // §6.10
+  appTokenFps?: string[]                                                                                              // §6.10
 }
 type Sealed = { kid: string; iv: Uint8Array; ct: Uint8Array }   // AAD `${shop}|${field}`
 ```
@@ -460,6 +478,69 @@ most 3 token calls started or joined:
 A success rewrites every field under the current key and drops the alternates,
 so a rollover also reseals.
 
+### 6.10 App-token fallback
+
+With `appTokenKey` set, `getSession` with `caller: 'app'` answers with an
+application-only token when the chain's answer would be `needs_reauth` (any
+reason, including after a failed credFp retry) or `tokenless(token_endpoint)`.
+`unreadable`, `legacy_unusable`, `import_failed` and `none` keep their answers;
+`caller: 'library'` never gets one, so `authenticate.admin` exchanges and heals
+the chain.
+
+A shop without a record never gets one: after the import and backfill, a
+missing record means uninstalled or never installed, and minting would create
+records and markers for arbitrary domains.
+
+- Serve `record.fallback`, read when serving (a 401 report may just have
+  dropped it), while `expires - now` exceeds `min(minValidity, lifetime / 2)`,
+  so a token shorter-lived than the caller asks for is still served; otherwise
+  mint. A fallback minted under another
+  signing `kid` (possibly revoked) or sealed under a dropped key counts as
+  absent.
+- Mint in its own single flight (`minting`), not `inflight`: it presents no
+  refresh token, so rotation rules don't order it, and chain callers, the
+  alarm and rollovers never join it. §6.1 steps 1 and 6 only: no
+  `attemptSince`, no alarm, nothing about the chain changes. The mint carries
+  the `version` the chain answered under and is discarded if it moved (before
+  or after the call); every caller waiting on it, joined or not, then asks the
+  chain again, and mints once more if the new answer still calls for it (at
+  most two mints per request). The starter is answered from the mint itself.
+  One `CALLER_WAIT` budget, started by a request's first wait for a token
+  call, covers every wait in it; a mint the budget doesn't cover still
+  finishes for the next caller.
+- Store `{ ...record, fallback }` without bumping `version`, and add its
+  fingerprint to `appTokenFps` (newest 5), which chain replacements carry
+  over. Every write that
+  replaces the chain's tokens builds a new record and so drops it; quarantine
+  and failures keep it. `reportUnauthorized` with its `tokenFp`, and an
+  issued write-back of it without a token (the library's 401 handling), drop
+  it and hold minting for a minute; an issued write-back with a token, or an
+  untagged copy of any token in `appTokenFps`, is a duplicate and is never
+  stored as the chain. Destroy and the quarantine GC delete it.
+  `expires` dates from the send (Shopify may return the token issued earlier
+  that minute).
+- Assertions are signed per attempt with `iat` 5 s back for clock skew.
+  Classification by status only: `5xx`, `429`, `408`, network, timeout,
+  challenge → transient; `402`, `404`, `423` → shop unavailable; other `4xx` → terminal
+  (a bad assertion, a revoked key and an uninstalled shop look alike); redirect,
+  bad shop, a signing failure → configuration.
+- Failures answer as the chain would. Transient and shop unavailable hold
+  minting in memory for `max(1 min, Retry-After)`, reported once per
+  `kind:code` change and logged otherwise. Terminal and configuration store
+  `mintRejected: { kid, since }` and are reported (only logged if the chain
+  changed meanwhile, discarding it): no mint under that `kid` for a day,
+  unless the chain is replaced (which drops the field) or a deploy changes the
+  `kid`.
+- A malformed `appTokenKey`, or one whose callback throws, turns the fallback
+  off and is reported at most hourly per isolate; it never fails the chain's
+  calls.
+- `describe` shows `fallback: { kid, expires }` and `mintRejected`; the
+  sealing key is in `kids`.
+
+The private key alone gets tokens for every installed store; the chain has no
+equivalent. It is opt-in, a Worker secret, and revoked in the Dev Dashboard on
+a leak.
+
 ## 7. Fleet jobs
 
 ### 7.1 Backfill
@@ -564,8 +645,12 @@ tokens survive the revoke, §2).
   adapter mapping and tag/stripping, backfill, rollover (each answer,
   joining a call in flight, an exchange during the call, reseal) and the
   sweep (stages, cursor, budget, breaker, configuration halt, 429, resume,
-  new passes, the final state write). The core harness fails a test
-  that makes an unscripted token call or leaves a scripted one unused.
+  new passes, the final state write), the app-token fallback (each trigger
+  and non-trigger, both callers, reuse and renewal, joins and discards,
+  clearing, backoff and the terminal hold), the assertion signer (both
+  algorithms and key forms, bad keys) and grant classification. The core
+  harness fails a test that makes an unscripted token call or leaves a
+  scripted one unused.
 - Workers: additionally, the alarm backoff across evictions with a broken
   keyring, and a record sealed under a decrypt-only (older) key.
 - Workers (`@cloudflare/vitest-plugin`, compat 2024-09-23 and current): fake
@@ -574,7 +659,9 @@ tokens survive the revoke, §2).
   migration; eviction mid-refresh; destroy during a fetch; import race; destroy
   clears the alarm at the old compat date; two rollover passes retire a
   presented refresh token; a sweep over real objects (expiring and legacy);
-  Sentry wrapper type test.
+  the fallback against a fake that verifies assertions (secret revocation,
+  renewal, a 401 report, an uninstalled shop, a revoked key); Sentry wrapper
+  type test.
 
 ## Changes after code review
 
@@ -624,3 +711,11 @@ tokens survive the revoke, §2).
    page and halted on it again. Configuration failures now halt only when they are
    half of a run of 10 or more, counted apart from rejections, so closed and
    uninstalled shops don't add up to a halt.
+
+## Changes in 0.3.0 (unreleased)
+
+1. Optional app-token fallback (§6.10): with `appTokenKey`, `loadOfflineSession`
+   answers with an application-only token, `source: 'app_token'`, while the
+   shop's chain can't produce one. The record gains `fallback`,
+   `mintRejected` and `appTokenFps`; nothing else in stored data changes, and without the option
+   behavior is unchanged.

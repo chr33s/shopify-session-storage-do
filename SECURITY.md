@@ -28,6 +28,10 @@ package protects. These are by design and not vulnerabilities:
   can load any shop's access token: RPC callers aren't authenticated.
 - Code that holds the encryption keyring can read every token. Encryption
   protects storage, not callers.
+- With `appTokenKey` configured, code that holds the private key can get a
+  token for every store that installed the app. That is how Shopify's
+  application-only grant works; revoke the key in the Dev Dashboard if it
+  leaks.
 - `describe` returns non-secret status (scopes, expiry times, failure codes).
   Exposing it is the app's choice, and should go through an authenticated
   route.
@@ -36,8 +40,10 @@ We especially want to hear about:
 
 - a token, refresh token or the client secret leaving the Durable Object, or
   reaching logs or reports;
-- a token call, which carries the client secret, being sent anywhere but the
-  shop's own `/admin/oauth/access_token`;
+- a token call, which carries the client secret or a signed client assertion,
+  being sent anywhere but the shop's own `/admin/oauth/access_token`;
+- an application-only token being served to `loadSession`, or minted for a
+  shop without a record;
 - one shop's object serving or overwriting another shop's credentials, or a
   sealed value opening under another shop or field;
 - a single response from Shopify, or a single call from the library, that

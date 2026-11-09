@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Optional app-token fallback. With the new `appTokenKey` option on
+  `createShopSessionsDurableObject`, `loadOfflineSession` answers with an
+  application-only access token (`source: 'app_token'`) while the shop's
+  refresh-token chain can't produce one: after Shopify rejects it, after an
+  emergency secret revocation, or while the token endpoint is down with no
+  token left. The token is minted with a JWT signed by the app's own key, not
+  the client secret. `loadSession` never gets one, so the library still
+  exchanges and heals the chain. Records gain optional `fallback`,
+  `mintRejected` and `appTokenFps` fields; without the option nothing changes.
+
 - Documentation for public use: a security model, an adoption checklist, a
   setup without Sentry, and guidance for apps that aren't migrating from
   `KVSessionStorage`.
