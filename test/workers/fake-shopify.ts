@@ -303,7 +303,7 @@ export class FakeShopify {
   private refresh(shop: string, presented: string): Response {
     const state = this.refreshTokens.get(presented)
     if (!state || state.shop !== shop || state.retired) {
-      return json(401, { error: 'invalid_request', error_description: 'This request requires an active refresh_token' })
+      return json(401, { error: 'invalid_grant', error_description: 'This request requires an active refresh_token' })
     }
     // Presenting a refresh token retires the one it replaced.
     if (state.parent) {

@@ -328,10 +328,11 @@ describe('2xx without a usable access token', () => {
 })
 
 describe('terminal', () => {
-  it('refresh: 401 invalid_request', async () => {
+  // Shopify answers a dead refresh token with invalid_grant (observed); invalid_request is the older answer.
+  it.each(['invalid_grant', 'invalid_request'])('refresh: 401 %s', async (error) => {
     const { result } = await run(
       'refresh',
-      json({ error: 'invalid_request', error_description: 'This request requires an active refresh_token' }, 401, {
+      json({ error, error_description: 'This request requires an active refresh_token' }, 401, {
         'x-request-id': 'req-401',
       }),
     )
@@ -339,7 +340,7 @@ describe('terminal', () => {
       outcome: 'terminal',
       sentAt: NOW,
       ambiguous: false,
-      code: 'invalid_request',
+      code: error,
       status: 401,
       requestId: 'req-401',
     })
@@ -353,7 +354,13 @@ describe('terminal', () => {
 
 describe('configuration', () => {
   it.each<[Grant, () => Response, string]>([
-    ['refresh', () => json({ error: 'invalid_request' }, 400), 'invalid_request'],
+    // What Shopify answers a wrong client secret (observed): 400, so never terminal.
+    [
+      'refresh',
+      () => json({ error: 'invalid_request', error_description: 'Missing or invalid client secret' }, 400),
+      'invalid_request',
+    ],
+    ['refresh', () => json({ error: 'application_cannot_be_found' }, 400), 'application_cannot_be_found'],
     ['refresh', () => json({ error: 'invalid_client' }, 401), 'invalid_client'],
     ['refresh', () => json({ error: 'invalid_subject_token' }, 400), 'invalid_subject_token'],
     ['refresh', () => html(401), 'http_401'],

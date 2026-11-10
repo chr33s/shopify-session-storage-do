@@ -37,6 +37,9 @@ const TOKEN_PATH = '/admin/oauth/access_token'
 const TOKEN_EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange'
 const OFFLINE_ACCESS_TOKEN = 'urn:shopify:params:oauth:token-type:offline-access-token'
 const JWT_BEARER_ASSERTION = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+// A dead refresh token gets 401 `invalid_grant` (observed 2026-11); `invalid_request` is kept for older answers.
+// Wrong client credentials get 400, so a 401 never means a configuration error here.
+const REFRESH_TERMINAL_ERRORS = new Set(['invalid_grant', 'invalid_request'])
 const MIGRATE_TERMINAL_ERRORS = new Set(['invalid_subject_token', 'invalid_requested_token_type'])
 const SHOP_UNAVAILABLE_STATUSES = new Set([402, 404, 423])
 // Only short machine codes make it into results; anything else could be free text from the body.
@@ -212,7 +215,7 @@ function classify(
   const code = error !== undefined && OAUTH_ERROR.test(error) ? error : `http_${status}`
   if (
     error !== undefined &&
-    ((grant === 'refresh' && status === 401 && error === 'invalid_request') ||
+    ((grant === 'refresh' && status === 401 && REFRESH_TERMINAL_ERRORS.has(error)) ||
       (grant === 'migrate' && status === 400 && MIGRATE_TERMINAL_ERRORS.has(error)))
   ) {
     return failure('terminal', sentAt, error, { status, requestId })
