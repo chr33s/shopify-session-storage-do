@@ -23,11 +23,19 @@ export type Sealed = { kid: string; iv: Uint8Array; ct: Uint8Array }
 
 export type SealedField = 'token' | 'refresh' | 'alternate' | 'fallback'
 
-export type TokenSource = 'exchange' | 'refresh' | 'migrate' | 'import' | 'legacy_exchange'
+export type TokenSource = 'exchange' | 'refresh' | 'migrate' | 'import' | 'legacy_exchange' | 'app_token'
 
-export type NeedsReauthReason = 'refresh_rejected' | 'legacy_rejected' | 'no_refresh_token'
+export type NeedsReauthReason = 'refresh_rejected' | 'legacy_rejected' | 'no_refresh_token' | 'app_token_rejected'
 
 export type FailureKind = 'transient' | 'shop_unavailable' | 'configuration'
+
+/**
+ * How application-only tokens are used when `appTokenKey` is configured.
+ * - `fallback` (default): mint only for `caller: 'app'` while the refresh-token chain can't produce a token (§6.10).
+ * - `primary`: the Durable Object is an ephemeral app-token cache; `loadSession` mints via `client_credentials` and
+ *   ignores stored refresh tokens (see DESIGN.md §6.11).
+ */
+export type AppTokenMode = 'fallback' | 'primary'
 
 export type ShopRecord = {
   v: 1
@@ -38,6 +46,16 @@ export type ShopRecord = {
   tokenFp?: string
   /** ms epoch. Absent together with `refresh` means `token` is a legacy token. */
   expires?: number
+  /**
+   * ms epoch: start of the pre-expiry renew window for an application-only primary cache (`source: 'app_token'`).
+   * Set with jitter (typically 180–480 s before `expires`) so fleet renewals don't thundering-herd.
+   */
+  renewAfter?: number
+  /**
+   * `kid` of the signing key that minted the primary app token (`source: 'app_token'`). Used for cache validity and
+   * immediate rollover when strict kid checking is on.
+   */
+  signingKid?: string
   refresh?: Sealed
   refreshFp?: string
   /** ms epoch. */
@@ -143,6 +161,21 @@ export type PutSessionResult = { status: 'stored' | 'merged' | 'ignored_stale' }
 export type ReportUnauthorizedInput = { shop: string; tokenFp: string }
 export type ReportUnauthorizedResult = { status: 'marked' | 'ignored_stale' }
 
+/**
+ * Evict a cached application-only token after an Admin API 401 and mint a replacement (DESIGN.md §6.11).
+ * When `failedAccessToken` is set, the Durable Object remints only if it still matches the cached plaintext
+ * (another request may already have refreshed it).
+ */
+export type InvalidateAndRefreshInput = { shop: string; failedAccessToken?: string }
+export type InvalidateAndRefreshResult =
+  | {
+      status: 'refreshed'
+      session: { shop: string; scope?: string; accessToken: string; expires?: number }
+      tokenFp: string
+    }
+  | { status: 'ignored_stale' }
+  | { status: 'failed'; kind: FailureKind | 'terminal' | 'configuration'; code: string }
+
 export type DestroyInput = { shop: string; uninstalledAt?: number }
 export type DestroyResult = { status: 'deleted' | 'kept_newer_install' }
 
@@ -191,6 +224,10 @@ export type ShopSessionStatus = {
   fallback?: { kid: string; expires: number }
   /** A mint Shopify rejected under this signing key; none is tried until the key or the chain changes. */
   mintRejected?: { kid: string; since: number }
+  /** Primary app-token cache: when the renew window opens (ms epoch). */
+  renewAfter?: number
+  /** Primary app-token cache: signing `kid` that minted the stored token. */
+  signingKid?: string
   nextAlarmAt?: number | null
   /** The live keyring's kids, current first: what the object seals and opens with now. Not secret. */
   keyring: { kids: string[] }
@@ -203,6 +240,8 @@ export interface ShopSessionsRpc {
   getSession(input: GetSessionInput): Promise<GetSessionResult>
   putSession(input: PutSessionInput): Promise<PutSessionResult>
   reportUnauthorized(input: ReportUnauthorizedInput): Promise<ReportUnauthorizedResult>
+  /** App-token primary mode (§6.11): evict a 401'd cache entry and mint again. */
+  invalidateAndRefresh(input: InvalidateAndRefreshInput): Promise<InvalidateAndRefreshResult>
   destroy(input: DestroyInput): Promise<DestroyResult>
   importLegacy(input: ImportLegacyInput): Promise<ImportLegacyResult>
   rollover(input: RolloverInput): Promise<RolloverResult>
@@ -300,6 +339,35 @@ export type AppTokenKey = {
   alg: 'ES256' | 'RS256'
 }
 
+/** Alias matching the application-only access-token spec's `AppTokenKeyConfig` name. */
+export type AppTokenKeyConfig = AppTokenKey
+
+/**
+ * One entry in the at-rest encryption keyring. Index 0 encrypts new writes; every entry is tried on decrypt.
+ * The Durable Object accepts the same material as the comma-separated `SHOPIFY_SESSION_ENCRYPTION_KEYS` secret
+ * (32-byte base64 keys); `version` is the sealing `kid` label when building a keyring from structured config.
+ */
+export type EncryptionKeyEntry = {
+  /** Version tag / sealing kid (e.g. `v2`). */
+  version: string
+  /** 32-byte secret as standard base64 (or hex). */
+  secret: string
+}
+
+/**
+ * Library configuration for the application-only (primary) token mode. Prefer the Durable Object option callbacks
+ * (`apiKey`, `appTokenKey`, `encryptionKeys`) in Workers; this shape documents the logical bindings.
+ */
+export type DOSessionStorageConfig = {
+  clientId: string
+  /** Active signing key for `client_assertion`. */
+  signingKey: AppTokenKeyConfig
+  /** Ordered keyring: index 0 encrypts new writes; all keys attempt decryption. */
+  encryptionKeys: [EncryptionKeyEntry, ...EncryptionKeyEntry[]]
+  /** Optional client secret for online user tokens, HMAC webhooks, or refresh-token fallback mode. */
+  clientSecret?: string
+}
+
 /** Mints application-only access tokens (client credentials grant with a signed client assertion). */
 export interface AppTokenClient {
   /** `kid` of the signing key. */
@@ -342,8 +410,18 @@ export type CoreDeps = {
   store: RecordStore
   alarm: AlarmControl
   tokens: TokenClient
-  /** Absent when no app token key is configured: no fallback. */
+  /** Absent when no app token key is configured: no fallback / primary minting. */
   appTokens?: AppTokenClient
+  /**
+   * How `appTokens` is used. Defaults to `fallback`. `primary` requires `appTokens` and turns the object into an
+   * ephemeral application-only token cache (DESIGN.md §6.11).
+   */
+  appTokenMode?: AppTokenMode
+  /**
+   * When true (primary mode), a cached token whose `signingKid` differs from the configured key is treated as a miss
+   * so a deploy that rolls the JWK forces an immediate remint. When false, the old kid is served until `renewAfter`.
+   */
+  strictSigningKid?: boolean
   keyring: Keyring
   /** Fingerprint of apiKey + apiSecretKey (see crypto.credentialFingerprint). */
   credFp: string
@@ -352,6 +430,8 @@ export type CoreDeps = {
   migrateLegacy: () => boolean
   legacyCutoff: number
   now: () => number
+  /** Delay used by primary-mode mint retries. Defaults to `setTimeout`. */
+  sleep?: (ms: number) => Promise<void>
   /** ctx.waitUntil */
   waitUntil: (promise: Promise<unknown>) => void
   report: (error: ShopSessionError) => void

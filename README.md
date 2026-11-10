@@ -337,6 +337,28 @@ the new `kid`, wait an hour for tokens minted under the old one to expire, then
 revoke the old key. If the private key leaks, revoke it in the Dev Dashboard:
 that ends every token minted with it.
 
+### App-token primary mode
+
+To replace offline refresh tokens entirely with [application-only access
+tokens][app-only], set `appTokenMode: 'primary'` alongside `appTokenKey`. Each
+shop's Durable Object becomes a read-through cache with a 3–8 minute pre-expiry
+renew window (`renewAfter`), single-flight minting, and transient retries. The
+client secret is optional in this mode. Legacy refresh-token rows are ignored
+and overwritten on the next `loadSession`.
+
+```ts
+export const ShopSessions = createShopSessionsDurableObject<Env>({
+  registry: (env) => ({ kv: env.SESSION }),
+  appTokenMode: 'primary',
+  appTokenKey: (env) => ({ kid: 'app-key-1', alg: 'ES256', privateKey: env.SHOPIFY_APP_TOKEN_KEY }),
+  // apiSecretKey optional here (still useful for webhook HMAC / online tokens in the app).
+})
+```
+
+After an Admin API `401`, call `sessionStorage.invalidateAndRefresh(shop, tokenUsed)`
+once and replay the request. Set `strictSigningKid: true` to remint immediately
+when you deploy a new signing `kid`. See DESIGN.md §6.11.
+
 [app-only]: https://shopify.dev/docs/apps/build/authentication-authorization/application-only-access-tokens
 
 ### What the library sees
@@ -372,23 +394,26 @@ Returns a class (`new (ctx, env)`, extending `DurableObject`) to export from
 the Worker entry. Every option that takes `env` is read from the host Worker's
 bindings, since a Durable Object receives nothing else.
 
-| Option                   | Default                               | Notes                                                                                                                     |
-| ------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `registry(env)`          | required                              | `{ kv, prefix? }`: KV namespace for registry markers; `prefix` defaults to `'shop-session:'`                              |
-| `apiKey(env)`            | `env.SHOPIFY_API_KEY`                 | throws when empty                                                                                                         |
-| `apiSecretKey(env)`      | `env.SHOPIFY_API_SECRET`              | throws when empty                                                                                                         |
-| `encryptionKeys(env)`    | `env.SHOPIFY_SESSION_ENCRYPTION_KEYS` | malformed: every call throws                                                                                              |
-| `legacyKv(env)`          | none                                  | KV holding `offline_<shop>` sessions from `KVSessionStorage`; `undefined` turns import off                                |
-| `migrateLegacy(env)`     | `false`                               | upgrade legacy tokens; read each time an alarm runs                                                                       |
-| `legacyCutoff`           | `Date.UTC(2027, 0, 1)`                | from then on legacy tokens aren't served and legacy exchanges are ignored                                                 |
-| `appTokenKey(env)`       | none                                  | `{ kid, alg: 'ES256' \| 'RS256', privateKey }` (PKCS#8 PEM or private JWK); see [App-token fallback](#app-token-fallback) |
-| `allowMyshopifyIo`       | `false`                               | accept `*.myshopify.io`; must match the adapter and backfill                                                              |
-| `report(error, context)` | none                                  | receives a `ShopSessionError`; the log line is written either way                                                         |
-| `fetch`, `now`           | globals                               | for tests                                                                                                                 |
+| Option                   | Default                               | Notes                                                                                                                                 |
+| ------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `registry(env)`          | required                              | `{ kv, prefix? }`: KV namespace for registry markers; `prefix` defaults to `'shop-session:'`                                          |
+| `apiKey(env)`            | `env.SHOPIFY_API_KEY`                 | throws when empty                                                                                                                     |
+| `apiSecretKey(env)`      | `env.SHOPIFY_API_SECRET`              | throws when empty (optional when `appTokenMode` is `primary`)                                                                         |
+| `encryptionKeys(env)`    | `env.SHOPIFY_SESSION_ENCRYPTION_KEYS` | malformed: every call throws                                                                                                          |
+| `legacyKv(env)`          | none                                  | KV holding `offline_<shop>` sessions from `KVSessionStorage`; `undefined` turns import off                                            |
+| `migrateLegacy(env)`     | `false`                               | upgrade legacy tokens; read each time an alarm runs                                                                                   |
+| `legacyCutoff`           | `Date.UTC(2027, 0, 1)`                | from then on legacy tokens aren't served and legacy exchanges are ignored                                                             |
+| `appTokenKey(env)`       | none                                  | `{ kid, alg: 'ES256' \| 'RS256', privateKey }` (PKCS#8 PEM or private JWK); see [App-token fallback](#app-token-fallback)             |
+| `appTokenMode`           | `'fallback'`                          | `'primary'` makes offline sessions an app-token cache; requires `appTokenKey` (see [App-token primary mode](#app-token-primary-mode)) |
+| `strictSigningKid`       | `false`                               | primary mode: remint when the cached `signingKid` differs from the configured key                                                     |
+| `allowMyshopifyIo`       | `false`                               | accept `*.myshopify.io`; must match the adapter and backfill                                                                          |
+| `report(error, context)` | none                                  | receives a `ShopSessionError`; the log line is written either way                                                                     |
+| `fetch`, `now`           | globals                               | for tests                                                                                                                             |
 
 The object's RPC methods (`getSession`, `putSession`, `reportUnauthorized`,
-`destroy`, `importLegacy`, `describe`) take a canonical `shop` that must match
-the object's name. Go through the adapter rather than calling them directly.
+`invalidateAndRefresh`, `destroy`, `importLegacy`, `describe`) take a canonical
+`shop` that must match the object's name. Go through the adapter rather than
+calling them directly.
 
 ### `new DurableObjectSessionStorage(options)`
 
@@ -398,16 +423,17 @@ the object's name. Go through the adapter rather than calling them directly.
 | `locationHint`     | `'enam'` | eastern North America; the first access fixes an object's location, so use one value at every call site |
 | `allowMyshopifyIo` | `false`  | must match the Durable Object                                                                           |
 
-| Method                                         | Does                                                                                                                    |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `loadSession(id)`, `storeSession(session)`     | the library's interface (offline ids `offline_<shop>` only)                                                             |
-| `loadOfflineSession(shop, { minValidityMs? })` | `ok` (`source?: 'app_token'`) / `none` / `needs_reauth` (`since`, `reason`) / `unavailable` (`reason`, `retryAfterMs?`) |
-| `reportUnauthorized(session)`                  | background 401 on an issued session                                                                                     |
-| `deleteShop(shop, { uninstalledAt? })`         | `deleted` or `kept_newer_install`                                                                                       |
-| `rollover(shop, { obtainedBefore })`           | replace the shop's credentials now, see [Rolling over](#rolling-over-credentials)                                       |
-| `describe(shop)`                               | non-secret status, see [Debugging](#debugging-with-describe)                                                            |
-| `deleteSession(id)`, `deleteSessions(ids)`     | delete without the reinstall guard                                                                                      |
-| `findSessionsByShop(shop)`                     | `[session]` when it has an access token, else `[]`                                                                      |
+| Method                                           | Does                                                                                                                    |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `loadSession(id)`, `storeSession(session)`       | the library's interface (offline ids `offline_<shop>` only)                                                             |
+| `loadOfflineSession(shop, { minValidityMs? })`   | `ok` (`source?: 'app_token'`) / `none` / `needs_reauth` (`since`, `reason`) / `unavailable` (`reason`, `retryAfterMs?`) |
+| `invalidateAndRefresh(shop, failedAccessToken?)` | primary mode: `refreshed` / `ignored_stale` / `failed`; remint after an Admin API 401                                   |
+| `reportUnauthorized(session)`                    | background 401 on an issued session                                                                                     |
+| `deleteShop(shop, { uninstalledAt? })`           | `deleted` or `kept_newer_install`                                                                                       |
+| `rollover(shop, { obtainedBefore })`             | replace the shop's credentials now, see [Rolling over](#rolling-over-credentials)                                       |
+| `describe(shop)`                                 | non-secret status, see [Debugging](#debugging-with-describe)                                                            |
+| `deleteSession(id)`, `deleteSessions(ids)`       | delete without the reinstall guard                                                                                      |
+| `findSessionsByShop(shop)`                       | `[session]` when it has an access token, else `[]`                                                                      |
 
 RPC infrastructure errors marked retryable are retried once with a fresh stub.
 

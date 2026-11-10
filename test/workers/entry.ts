@@ -11,6 +11,7 @@ export type Env = {
   BROKEN_KEYRING: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
   NO_CREDENTIALS: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
   APP_TOKENS: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
+  APP_TOKEN_PRIMARY: DurableObjectNamespace<ShopSessionsDurableObject<Env>>
   REGISTRY: KVNamespace
   LEGACY: KVNamespace
   ROTATION_REGISTRY: KVNamespace
@@ -37,6 +38,15 @@ export const TestShopSessions = createShopSessionsDurableObject<Env>({
 export const AppTokenShopSessions = createShopSessionsDurableObject<Env>({
   registry: (env) => ({ kv: env.REGISTRY }),
   appTokenKey: () => ({ kid: APP_KEY_ID, alg: 'ES256', privateKey: APP_PRIVATE_JWK }),
+  ...testing,
+})
+
+export const AppTokenPrimaryShopSessions = createShopSessionsDurableObject<Env>({
+  registry: (env) => ({ kv: env.REGISTRY }),
+  appTokenKey: () => ({ kid: APP_KEY_ID, alg: 'ES256', privateKey: APP_PRIVATE_JWK }),
+  appTokenMode: 'primary',
+  // Primary mode needs no client secret: omit it to prove minting works with the signing key alone.
+  apiSecretKey: () => undefined,
   ...testing,
 })
 

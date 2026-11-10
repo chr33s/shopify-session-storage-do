@@ -23,6 +23,8 @@ import type {
   GetSessionResult,
   ImportLegacyInput,
   ImportLegacyResult,
+  InvalidateAndRefreshInput,
+  InvalidateAndRefreshResult,
   PutSessionInput,
   PutSessionResult,
   ReportContext,
@@ -44,12 +46,16 @@ import {
   DEFAULT_REFRESH_EXPIRES_IN,
   HOUR,
   MINT_BACKOFF,
+  MINT_MAX_ATTEMPTS,
+  MINT_RETRY_BACKOFF_MS,
   MIN_ALARM_DELAY,
   SECOND,
   acceptsLegacyExchange,
   acceptsNoRefreshExchange,
   alarmAction,
   alarmErrorDelay,
+  appCacheFresh,
+  appCacheServable,
   attemptOutstanding,
   clampMinValidity,
   decideExchange,
@@ -60,6 +66,7 @@ import {
   fallbackApplies,
   fallbackFresh,
   isAppToken,
+  isAppTokenCache,
   mintRejected,
   finiteNumber,
   holdsLegacyCopy,
@@ -73,6 +80,7 @@ import {
   nonEmpty,
   parseLegacySession,
   planImport,
+  renewAfterAt,
   strip,
   successRecord,
   terminalRecord,
@@ -153,18 +161,25 @@ export class ShopSessions implements ShopSessionsRpc {
   }
 
   // -------------------------------------------------------------------------
-  // getSession (§6.2)
+  // getSession (§6.2, §6.11)
 
   async getSession(input: GetSessionInput): Promise<GetSessionResult> {
     this.assertShop(input.shop)
     const minValidity = clampMinValidity(input.minValidityMs)
     const budget: Budget = {}
-    const chain = await this.chainSession(minValidity, budget)
     const appTokens = this.deps.appTokens
+    if (this.isPrimary() && appTokens) return this.primarySession(appTokens, minValidity, budget)
+
+    const chain = await this.chainSession(minValidity, budget)
     // Never for the library: a session from loadSession would stop authenticate.admin from exchanging, and that
     // exchange is what heals the chain.
     if (input.caller !== 'app' || !appTokens || !fallbackApplies(chain.answer)) return chain.answer
     return this.fallbackSession(appTokens, minValidity, budget, chain)
+  }
+
+  /** Application-only tokens as the offline session source (DESIGN.md §6.11). */
+  private isPrimary(): boolean {
+    return this.deps.appTokenMode === 'primary' && this.deps.appTokens !== undefined
   }
 
   /** The answer from the refresh-token chain (§6.2). */
@@ -238,7 +253,7 @@ export class ShopSessions implements ShopSessionsRpc {
   }
 
   // -------------------------------------------------------------------------
-  // putSession (§6.3)
+  // putSession (§6.3, §6.11)
 
   async putSession(input: PutSessionInput): Promise<PutSessionResult> {
     this.assertShop(input.shop)
@@ -247,6 +262,7 @@ export class ShopSessions implements ShopSessionsRpc {
     if (canonicalShop(session.shop, { allowMyshopifyIo: true }) !== this.deps.shop) {
       throw new TypeError('Session shop does not match this object')
     }
+    if (this.isPrimary()) return this.putPrimary(input)
     if (input.issued) return this.putIssued(input.issued.tokenFp, session)
 
     const accessToken = nonEmpty(session.accessToken)
@@ -426,6 +442,11 @@ export class ShopSessions implements ShopSessionsRpc {
     this.assertShop(input.shop)
     return this.critical(async () => {
       const record = await this.deps.store.get()
+      if (this.isPrimary() && isAppTokenCache(record) && record.tokenFp === input.tokenFp) {
+        // Force the next load to remint; keep the ciphertext so a racing remint can still verify the failed token.
+        await this.deps.store.put({ ...record, renewAfter: 0, tokenInvalid: true })
+        return { status: 'marked' }
+      }
       if (record?.fallback && record.fallback.tokenFp === input.tokenFp) {
         // A revoked signing key, or an uninstall: drop it; an app caller mints again after the backoff if it still can.
         await this.dropFallback(record, input.tokenFp)
@@ -435,6 +456,340 @@ export class ShopSessions implements ShopSessionsRpc {
       if (!record.tokenInvalid) await this.deps.store.put({ ...record, tokenInvalid: true })
       return { status: 'marked' }
     })
+  }
+
+  /**
+   * Evict a cached application-only token after an Admin API 401 and mint a replacement (§6.11).
+   * When `failedAccessToken` is provided, remints only if it still matches the cache (another request may have
+   * refreshed it already).
+   */
+  async invalidateAndRefresh(input: InvalidateAndRefreshInput): Promise<InvalidateAndRefreshResult> {
+    this.assertShop(input.shop)
+    const appTokens = this.deps.appTokens
+    if (!this.isPrimary() || !appTokens) {
+      throw new TypeError('invalidateAndRefresh requires app-token primary mode')
+    }
+
+    const failed = nonEmpty(input.failedAccessToken)
+    if (failed) {
+      const matched = await this.critical(async (): Promise<boolean> => {
+        const record = await this.deps.store.get()
+        if (!isAppTokenCache(record)) return false
+        const current = await this.open(record.token, 'token')
+        if (current === undefined) {
+          this.reportUnreadable()
+          return false
+        }
+        if (current !== failed) return false
+        await this.deps.store.put({ ...record, renewAfter: 0, tokenInvalid: true })
+        return true
+      })
+      if (!matched) return { status: 'ignored_stale' }
+    } else {
+      await this.critical(async () => {
+        const record = await this.deps.store.get()
+        if (!isAppTokenCache(record)) return
+        await this.deps.store.put({ ...record, renewAfter: 0, tokenInvalid: true })
+      })
+    }
+
+    const minted = await this.runPrimaryMint(appTokens)
+    if (minted !== 'joined' && minted.answer?.status === 'ok') {
+      return {
+        status: 'refreshed',
+        session: minted.answer.session,
+        tokenFp: minted.answer.tokenFp,
+      }
+    }
+    if (minted !== 'joined' && (minted.status === 'terminal' || minted.status === 'failed')) {
+      const code = this.mintReported?.split(':')[1] ?? minted.status
+      const kind = minted.status === 'terminal' ? 'terminal' : 'transient'
+      return { status: 'failed', kind, code }
+    }
+    // Joined another mint, or discarded: re-read whatever is cached now.
+    const record = await this.deps.store.get()
+    const served = record ? await this.servedPrimary(appTokens, record) : undefined
+    if (served?.status === 'ok') {
+      return { status: 'refreshed', session: served.session, tokenFp: served.tokenFp }
+    }
+    return { status: 'ignored_stale' }
+  }
+
+  // -------------------------------------------------------------------------
+  // App-token primary cache (DESIGN.md §6.11)
+
+  /**
+   * Read-through cache for application-only tokens. Legacy refresh-token rows (no `signingKid`) are ignored and
+   * overwritten by a fresh mint — no manual migration.
+   */
+  private async primarySession(
+    appTokens: AppTokenClient,
+    _minValidity: number,
+    budget: Budget,
+  ): Promise<GetSessionResult> {
+    const record = await this.deps.store.get()
+    const cached = record ? await this.servedPrimary(appTokens, record) : undefined
+    if (cached) {
+      await this.maybeResealPrimary(record!)
+      return cached
+    }
+
+    if (this.mintBackoffUntil > this.deps.now()) {
+      const stale = record ? await this.serveStalePrimary(record) : undefined
+      return (
+        stale ?? {
+          status: 'tokenless',
+          reason: 'token_endpoint',
+          retryAfterMs: this.mintBackoffUntil - this.deps.now(),
+        }
+      )
+    }
+    if (record && mintRejected(record, appTokens.kid, this.deps.now())) {
+      return {
+        status: 'needs_reauth',
+        since: record.mintRejected!.since,
+        reason: 'app_token_rejected',
+      }
+    }
+
+    const minted = await this.waitBounded(this.runPrimaryMint(appTokens), budget)
+    if (minted !== 'joined' && minted?.answer) return minted.answer
+    if (minted === undefined) {
+      const stale = record ? await this.serveStalePrimary(record) : undefined
+      return stale ?? { status: 'tokenless', reason: 'token_endpoint' }
+    }
+    if (minted !== 'joined' && minted.status === 'terminal') {
+      const rejected = await this.deps.store.get()
+      if (rejected?.mintRejected) {
+        return { status: 'needs_reauth', since: rejected.mintRejected.since, reason: 'app_token_rejected' }
+      }
+      return { status: 'none' }
+    }
+
+    const after = await this.deps.store.get()
+    const again = after ? await this.servedPrimary(appTokens, after) : undefined
+    if (again) return again
+    const stale = after ? await this.serveStalePrimary(after) : undefined
+    return stale ?? { status: 'tokenless', reason: 'token_endpoint' }
+  }
+
+  /** A cached primary token that is still inside its renew window (and kid policy). */
+  private async servedPrimary(appTokens: AppTokenClient, record: ShopRecord): Promise<GetSessionResult | undefined> {
+    if (
+      !appCacheFresh(record, {
+        now: this.deps.now(),
+        signingKid: appTokens.kid,
+        strictSigningKid: this.deps.strictSigningKid === true,
+      })
+    ) {
+      return undefined
+    }
+    const token = await this.open(record.token!, 'token')
+    if (token === undefined) {
+      this.reportUnreadable()
+      return undefined
+    }
+    return this.primaryAnswer(record, token)
+  }
+
+  /** Still-valid cached token when a remint fails inside the pre-expiry window. */
+  private async serveStalePrimary(record: ShopRecord): Promise<GetSessionResult | undefined> {
+    if (!appCacheServable(record, this.deps.now())) return undefined
+    const token = await this.open(record.token!, 'token')
+    return token === undefined ? undefined : this.primaryAnswer(record, token)
+  }
+
+  private primaryAnswer(record: ShopRecord, token: string): GetSessionResult {
+    return {
+      status: 'ok',
+      session: strip({
+        shop: this.deps.shop,
+        scope: record.scope,
+        accessToken: token,
+        expires: record.expires,
+      }),
+      tokenFp: record.tokenFp ?? '',
+      source: 'app_token',
+    }
+  }
+
+  /** Re-seal under the current keyring entry when the ciphertext still names an older kid. */
+  private async maybeResealPrimary(record: ShopRecord): Promise<void> {
+    if (!isAppTokenCache(record) || record.token.kid === this.deps.keyring.currentKid) return
+    const plain = await this.open(record.token, 'token')
+    if (plain === undefined) return
+    const token = await this.seal(plain, 'token')
+    await this.critical(async () => {
+      const current = await this.deps.store.get()
+      if (!isAppTokenCache(current) || current.tokenFp !== record.tokenFp) return
+      if (current.token.kid === this.deps.keyring.currentKid) return
+      await this.deps.store.put({ ...current, token })
+    })
+  }
+
+  /**
+   * OAuth / library writes in primary mode only mark the shop installed (and drop any refresh-token chain). The next
+   * `getSession` mints an application-only token. Issued write-backs of a 401 clear the cache window.
+   */
+  private async putPrimary(input: PutSessionInput): Promise<PutSessionResult> {
+    const session = input.session
+    if (input.issued) {
+      return this.critical(async () => {
+        const record = await this.deps.store.get()
+        if (!record || record.tokenFp !== input.issued!.tokenFp) {
+          if (record && isAppToken(record, input.issued!.tokenFp) && !nonEmpty(session.accessToken)) {
+            await this.deps.store.put({ ...record, renewAfter: 0, tokenInvalid: true })
+            return MERGED
+          }
+          return IGNORED
+        }
+        if (!nonEmpty(session.accessToken)) {
+          await this.deps.store.put({ ...record, renewAfter: 0, tokenInvalid: true })
+          return MERGED
+        }
+        await this.mergeScope(record, session.scope)
+        return MERGED
+      })
+    }
+
+    const accessToken = nonEmpty(session.accessToken)
+    if (!accessToken) return IGNORED
+
+    const accessFp = await fingerprint(accessToken)
+    const now = this.deps.now()
+    const created = await this.critical(async (): Promise<ShopRecord | undefined> => {
+      const existing = await this.deps.store.get()
+      // An install / reinstall: keep a live app-token cache if the library is only writing back scopes; otherwise
+      // drop the refresh-token vault and let the next load mint.
+      if (isAppTokenCache(existing) && existing.tokenFp === accessFp) {
+        await this.mergeScope(existing, session.scope)
+        return undefined
+      }
+      const next: ShopRecord = strip({
+        v: 1 as const,
+        shop: this.deps.shop,
+        scope: nonEmpty(session.scope) ?? existing?.scope,
+        pairObtainedAt: now,
+        source: 'exchange' as const,
+        appTokenFps: existing?.appTokenFps,
+      })
+      await this.deps.store.put(next)
+      this.version++
+      await this.deps.alarm.delete().catch(noop)
+      return existing ? undefined : next
+    })
+    if (created) await this.writeMarker(created.pairObtainedAt).catch((error) => this.logError('put', error))
+    return { status: 'stored' }
+  }
+
+  private runPrimaryMint(appTokens: AppTokenClient): Promise<MintResult | 'joined'> {
+    return this.single(
+      () => this.minting,
+      (call) => (this.minting = call),
+      'mint',
+      () => this.mintPrimary(appTokens),
+    )
+  }
+
+  /**
+   * Mint with up to 3 retries on transient failures (new assertion / `jti` each attempt). On failure inside the
+   * pre-expiry window, the cached token is returned instead of an error.
+   */
+  private async mintPrimary(appTokens: AppTokenClient): Promise<MintResult> {
+    let result: TokenCallResult | undefined
+    for (let attempt = 0; attempt < MINT_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        const delayMs = MINT_RETRY_BACKOFF_MS[attempt - 1] ?? MINT_RETRY_BACKOFF_MS[MINT_RETRY_BACKOFF_MS.length - 1]!
+        await this.sleep(delayMs)
+      }
+      const sentAt = this.deps.now()
+      try {
+        result = await appTokens.mint(this.deps.shop)
+      } catch {
+        result = { outcome: 'transient', sentAt, ambiguous: true, code: 'exception' }
+      }
+      if (result.outcome === 'success') break
+      if (result.outcome !== 'transient') break
+    }
+    if (!result) return { status: 'failed' }
+
+    if (result.outcome !== 'success') {
+      const rejected = result.outcome === 'terminal' || result.outcome === 'configuration'
+      const kind = rejected ? 'terminal' : result.outcome
+      const context = this.resultContext('mint', kind, result.code, result)
+      if (!rejected) {
+        this.mintBackoffUntil = this.deps.now() + Math.max(MINT_BACKOFF, result.retryAfterMs ?? 0)
+        const key = `${kind}:${result.code}`
+        if (this.mintReported !== key) this.emit('Shopify app token request failed', context)
+        else this.log('Shopify app token request failed', context)
+        this.mintReported = key
+        const stale = await this.deps.store.get()
+        const served = stale ? await this.serveStalePrimary(stale) : undefined
+        return served ? { status: 'failed', answer: served } : { status: 'failed' }
+      }
+      const stored = await this.critical(async (): Promise<boolean> => {
+        const record = (await this.deps.store.get()) ?? {
+          v: 1 as const,
+          shop: this.deps.shop,
+          pairObtainedAt: this.deps.now(),
+        }
+        await this.deps.store.put({ ...record, mintRejected: { kid: appTokens.kid, since: this.deps.now() } })
+        return true
+      })
+      if (!stored) {
+        this.log('Shopify app token request failed', context)
+        return { status: 'discarded' }
+      }
+      this.emit('Shopify app token request failed', context)
+      return { status: 'terminal' }
+    }
+
+    if (!validSeconds(result.expiresIn)) {
+      this.emit('Shopify app token response missing expires_in', {
+        shop: this.deps.shop,
+        op: 'mint',
+        kind: 'success',
+        code: 'missing_fields',
+        requestId: result.requestId,
+      })
+    }
+    const token = await this.seal(result.accessToken, 'token')
+    const tokenFp = await fingerprint(result.accessToken)
+    const lifetime = validSeconds(result.expiresIn) ? result.expiresIn * SECOND : DEFAULT_EXPIRES_IN
+    const obtainedAt = result.sentAt
+    const expires = obtainedAt + lifetime
+    const renewAfter = renewAfterAt(expires)
+    const answer = await this.critical(async (): Promise<GetSessionResult | undefined> => {
+      const previous = await this.deps.store.get()
+      const next: ShopRecord = strip({
+        v: 1 as const,
+        shop: this.deps.shop,
+        scope: nonEmpty(result.scope) ?? previous?.scope,
+        token,
+        tokenFp,
+        expires,
+        renewAfter,
+        signingKid: appTokens.kid,
+        pairObtainedAt: obtainedAt,
+        source: 'app_token' as const,
+        appTokenFps: withAppTokenFp(previous?.appTokenFps, tokenFp),
+      })
+      await this.deps.store.put(next)
+      this.version++
+      await this.deps.alarm.delete().catch(noop)
+      return this.primaryAnswer(next, result.accessToken)
+    })
+    if (!answer) return { status: 'discarded' }
+    this.mintReported = undefined
+    this.mintBackoffUntil = 0
+    await this.writeMarker(obtainedAt).catch((error) => this.logError('mint', error))
+    this.log('Serving an application-only token', { shop: this.deps.shop, op: 'mint', kind: 'success', code: 'minted' })
+    return { status: 'success', answer }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    if (this.deps.sleep) return this.deps.sleep(ms)
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
   // -------------------------------------------------------------------------
@@ -936,6 +1291,16 @@ export class ShopSessions implements ShopSessionsRpc {
     const view = await this.load()
     const record = view.record
     if (!record) return
+    // Application-only primary caches have no refresh chain; the next loadSession remints.
+    if (this.isPrimary() || isAppTokenCache(record)) {
+      if (!holdsLegacyCopy(record)) await this.deleteLegacyKeys()
+      await this.putMarker(record.pairObtainedAt)
+      await this.critical(async () => {
+        const current = await this.deps.store.get()
+        if (current) await this.deps.alarm.delete().catch(noop)
+      })
+      return
+    }
     const action = alarmAction(record, this.scheduleOptions(view.unreadable))
     if (action === 'wipe' && record.needsReauth) {
       if (await this.wipeQuarantined(record.needsReauth.since)) return

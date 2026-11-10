@@ -28,6 +28,14 @@
   exchanges and heals the chain. Records gain optional `fallback`,
   `mintRejected` and `appTokenFps` fields; without the option nothing changes.
 
+- App-token primary mode. With `appTokenMode: 'primary'` (and `appTokenKey`),
+  each shop's Durable Object is an ephemeral application-only token cache:
+  `loadSession` mints via `client_credentials` + JWT assertion, renews with
+  3–8 minute jitter (`renewAfter`), retries transient mint failures, and
+  exposes `invalidateAndRefresh` for Admin API 401 recovery. The client secret
+  is optional in this mode. Legacy refresh-token rows are ignored and
+  overwritten on the next load. See DESIGN.md §6.11.
+
 - Documentation for public use: a security model, an adoption checklist, a
   setup without Sentry, and guidance for apps that aren't migrating from
   `KVSessionStorage`.

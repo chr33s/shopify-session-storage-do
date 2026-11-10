@@ -51,6 +51,15 @@ export const MINT_BACKOFF = MINUTE
 /** A rejected mint is tried again after this even under the same key and chain. */
 export const MINT_REJECTED_RECHECK = DAY
 export const MAX_APP_TOKEN_FPS = 5
+/** Pre-expiry renew window lower bound (Shopify's recommended jitter floor). */
+export const RENEW_JITTER_MIN_S = 180
+/** Pre-expiry renew window upper bound (Shopify's recommended jitter ceiling). */
+export const RENEW_JITTER_MAX_S = 480
+/** While a primary-mode remint fails, keep serving the cache until this close to absolute expiry. */
+export const APP_CACHE_SERVE_GRACE = 5 * SECOND
+/** Primary-mode mint retries after transient failures: delays before attempt 2, 3 and 4. */
+export const MINT_RETRY_BACKOFF_MS = [200, 500, 1200] as const
+export const MINT_MAX_ATTEMPTS = 1 + MINT_RETRY_BACKOFF_MS.length
 
 export type TokenIntent = 'refresh' | 'migrate'
 export type DelayMode = 'interactive' | 'alarm'
@@ -201,6 +210,60 @@ export function withAppTokenFp(fps: readonly string[] | undefined, fp: string): 
 export function mintRejected(record: ShopRecord, kid: string, now: number): boolean {
   const rejected = record.mintRejected
   return rejected !== undefined && rejected.kid === kid && now < rejected.since + MINT_REJECTED_RECHECK
+}
+
+// ---------------------------------------------------------------------------
+// App-token primary cache (DESIGN.md §6.11)
+
+/** A stored application-only primary cache (`source: 'app_token'` with renew window + signing kid). */
+export function isAppTokenCache(record: ShopRecord | undefined): record is ShopRecord & {
+  source: 'app_token'
+  token: Sealed
+  tokenFp: string
+  expires: number
+  renewAfter: number
+  signingKid: string
+} {
+  return (
+    record?.source === 'app_token' &&
+    record.token !== undefined &&
+    typeof record.tokenFp === 'string' &&
+    typeof record.expires === 'number' &&
+    typeof record.renewAfter === 'number' &&
+    typeof record.signingKid === 'string'
+  )
+}
+
+/**
+ * `expiresAt - jitter`, with jitter uniform in [180 s, 480 s] (Shopify's recommended 3–8 minute window).
+ * `random` is in [0, 1]; tests pass a fixed value.
+ */
+export function renewAfterAt(expiresAt: number, random: number = Math.random()): number {
+  const unit = Number.isFinite(random) ? Math.min(1, Math.max(0, random)) : Math.random()
+  const span = RENEW_JITTER_MAX_S - RENEW_JITTER_MIN_S
+  const jitterS = RENEW_JITTER_MIN_S + Math.min(span, Math.floor(unit * (span + 1)))
+  return expiresAt - jitterS * SECOND
+}
+
+export type AppCacheFreshOptions = {
+  now: number
+  signingKid: string
+  /** When true, a mismatched `signingKid` is a miss even before `renewAfter`. */
+  strictSigningKid?: boolean
+}
+
+/**
+ * Whether the primary app-token cache should be served without reminting. Decryptability is checked by the caller.
+ */
+export function appCacheFresh(record: ShopRecord, options: AppCacheFreshOptions): boolean {
+  if (!isAppTokenCache(record) || record.tokenInvalid) return false
+  if (options.strictSigningKid && record.signingKid !== options.signingKid) return false
+  return options.now < record.renewAfter
+}
+
+/** Still within the absolute lifetime (minus grace): usable when a remint fails during the renew window. */
+export function appCacheServable(record: ShopRecord, now: number): boolean {
+  return isAppTokenCache(record) && !record.tokenInvalid && now < record.expires - APP_CACHE_SERVE_GRACE
 }
 
 type OptionalField = { [K in keyof ShopRecord]-?: undefined extends ShopRecord[K] ? K : never }[keyof ShopRecord]
@@ -374,6 +437,8 @@ export function describeRecord(
     },
     fallback: record.fallback && { kid: record.fallback.kid, expires: record.fallback.expires },
     mintRejected: record.mintRejected && { kid: record.mintRejected.kid, since: record.mintRejected.since },
+    renewAfter: record.renewAfter,
+    signingKid: record.signingKid,
     nextAlarmAt: nextAlarm,
   })
 }

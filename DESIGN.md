@@ -188,7 +188,9 @@ createShopSessionsDurableObject<Env>({
   encryptionKeys?(env)                                 // default env.SHOPIFY_SESSION_ENCRYPTION_KEYS
   legacyKv?(env): KVNamespace | undefined              // app gates per env, e.g. SHOP_SESSIONS_LEGACY_IMPORT === 'on'
   migrateLegacy?(env): boolean                         // default false; read when the alarm runs
-  appTokenKey?(env): { kid, alg: 'ES256' | 'RS256', privateKey: PEM | JWK } | undefined   // §6.10
+  appTokenKey?(env): { kid, alg: 'ES256' | 'RS256', privateKey: PEM | JWK } | undefined   // §6.10 / §6.11
+  appTokenMode?: 'fallback' | 'primary' | (env) => ...                                   // §6.11; default fallback
+  strictSigningKid?: boolean | (env) => boolean                                          // §6.11
   legacyCutoff?: number                                // default Date.UTC(2027, 0, 1)
   allowMyshopifyIo?: boolean
   report?(error, context): void
@@ -557,6 +559,36 @@ The private key alone gets tokens for every installed store; the chain has no
 equivalent. It is opt-in, a Worker secret, and revoked in the Dev Dashboard on
 a leak.
 
+### 6.11 App-token primary mode
+
+With `appTokenKey` and `appTokenMode: 'primary'`, the Durable Object is an
+ephemeral application-only token cache rather than a refresh-token vault.
+`client_credentials` + JWT `client_assertion` replaces offline `refresh_token`
+swaps for every offline `loadSession` / `loadOfflineSession` (both callers).
+The client secret is optional in this mode (still useful for HMAC webhooks or
+online token exchange in the app).
+
+- Cache fields on the record: `source: 'app_token'`, sealed `token`, `expires`,
+  `renewAfter` (expires minus a uniform 180–480 s jitter), `signingKid`.
+- Serve while `now < renewAfter`, the ciphertext opens, and (when
+  `strictSigningKid`) `signingKid` matches the configured key. Otherwise mint.
+  A ciphertext sealed under an older keyring entry is re-sealed under the
+  current key on a successful serve (lazy re-encryption).
+- Mint in the existing `minting` single flight. Up to 3 retries on transient
+  failures (5xx / network / timeout) with backoff 200 ms, 500 ms, 1200 ms and a
+  fresh assertion (`jti`) each attempt; no retry on 4xx. If a remint fails
+  while `now < expires - 5 s`, serve the still-valid cache.
+- A legacy refresh-token row (no `signingKid` / not `source: 'app_token'`) is
+  ignored on load and overwritten by the mint — no migration script.
+- `putSession` of an OAuth exchange only marks the shop installed (drops any
+  refresh-token material); the next load mints. Issued 401 write-backs set
+  `renewAfter = 0` and `tokenInvalid`.
+- `invalidateAndRefresh({ shop, failedAccessToken? })`: if the plaintext still
+  matches the cache (or no token was given), set `renewAfter = 0` and mint.
+  Wrap Admin GraphQL: on HTTP 401, call once and replay.
+- Alarms do not refresh primary caches. `describe` reports `renewAfter` and
+  `signingKid`.
+
 ## 7. Fleet jobs
 
 ### 7.1 Backfill
@@ -774,7 +806,11 @@ are `runRotation(params, step, deps)` in `src/rotation.ts`, with `step` and
    shop's chain can't produce one. The record gains `fallback`,
    `mintRejected` and `appTokenFps`; nothing else in stored data changes, and without the option
    behavior is unchanged.
-2. `describe` reports the object's live configuration: `keyring.kids` (current
+2. App-token primary mode (§6.11): with `appTokenMode: 'primary'`, offline
+   sessions are an ephemeral application-only token cache (`renewAfter`,
+   `signingKid`, mint retries, `invalidateAndRefresh`). The client secret is
+   optional; legacy refresh-token rows are overwritten on the next load.
+3. `describe` reports the object's live configuration: `keyring.kids` (current
    first) and `credentials.credFp`. The optional rotation Workflow (§7.3,
    `./workflow`) checks deploys against them.
-3. A refresh `401 invalid_grant` is terminal (§2), as `401 invalid_request` was.
+4. A refresh `401 invalid_grant` is terminal (§2), as `401 invalid_request` was.

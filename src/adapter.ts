@@ -8,6 +8,7 @@ import type {
   DestroyInput,
   DestroyResult,
   GetSessionInput,
+  InvalidateAndRefreshResult,
   IssuedTag,
   NeedsReauthReason,
   PutSessionInput,
@@ -203,6 +204,31 @@ export class DurableObjectSessionStorage {
     }
     const shop = this.requireShop(session.shop, 'reportUnauthorized')
     await this.call(shop, (stub) => stub.reportUnauthorized({ shop, tokenFp: issued.tokenFp }))
+  }
+
+  /**
+   * App-token primary mode: after an Admin API `401`, evict the cached token (when it still matches) and mint a
+   * replacement. Replay the GraphQL request with the returned session. See DESIGN.md §6.11.
+   */
+  async invalidateAndRefresh(
+    shop: string,
+    failedAccessToken?: string,
+  ): Promise<
+    | { status: 'refreshed'; session: Session }
+    | { status: 'ignored_stale' }
+    | { status: 'failed'; kind: string; code: string }
+  > {
+    const canonical = this.requireShop(shop, 'invalidateAndRefresh')
+    const result: InvalidateAndRefreshResult = await this.call(canonical, (stub) =>
+      stub.invalidateAndRefresh({
+        shop: canonical,
+        ...(failedAccessToken !== undefined ? { failedAccessToken } : {}),
+      }),
+    )
+    if (result.status === 'refreshed') {
+      return { status: 'refreshed', session: issueSession(canonical, result.session, result.tokenFp) }
+    }
+    return result
   }
 
   /** Deletes the shop's session, unless a pair obtained after `uninstalledAt` shows the shop reinstalled. */
