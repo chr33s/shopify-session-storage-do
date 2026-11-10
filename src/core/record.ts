@@ -330,12 +330,15 @@ export function alarmAction(record: ShopRecord, o: ScheduleOptions): AlarmAction
 // ---------------------------------------------------------------------------
 // describe
 
+/** What `describe` says about the record; the core adds the live configuration. */
+export type RecordStatus = Omit<ShopSessionStatus, 'keyring' | 'credentials'>
+
 export function describeRecord(
   shop: string,
   record: ShopRecord | undefined,
   nextAlarm: number | null,
   unreadable: boolean,
-): ShopSessionStatus {
+): RecordStatus {
   if (!record) return { shop, exists: false, state: 'none', nextAlarmAt: nextAlarm }
   const state: ShopSessionStatus['state'] = unreadable
     ? 'unreadable'

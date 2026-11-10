@@ -113,6 +113,7 @@ async function importKeyring(keys: Uint8Array<ArrayBuffer>[]): Promise<Keyring> 
 
   const keyring: Keyring = {
     currentKid: current.kid,
+    kids: entries.map((entry) => entry.kid),
 
     async seal(plaintext: string, aad: string): Promise<Sealed> {
       // Guards against sealing the string 'undefined' as if it were a token.

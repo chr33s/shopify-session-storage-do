@@ -65,10 +65,13 @@ Shopify
   (≤ 30 days after first use, ≤ its expiry); retrying it returns the same pair.
 - Any exchange retires every other refresh token for the shop; a DO refresh that
   succeeds was therefore processed before any exchange it overlaps with.
-- Terminal: refresh `401 invalid_grant` (observed 2026-11; `401
-  invalid_request` also accepted); migration `400 invalid_subject_token`
-  / `invalid_requested_token_type`. A wrong client id or secret answers `400`. Transient: network, timeout, `5xx`, `429`,
-  challenge pages. Shop state: `402`, `423`, `404`. Other `4xx`/`3xx`:
+- Terminal: refresh `401 invalid_grant` ("This request requires an active
+  refresh_token", for a retired or unknown token; `401 invalid_request` is
+  also accepted); migration `400 invalid_subject_token` /
+  `invalid_requested_token_type`. A wrong client secret answers `400
+  invalid_request`, an unknown client id `400 application_cannot_be_found`,
+  so a `401` never means configuration. Transient: network, timeout, `5xx`,
+  `429`, challenge pages. Shop state: `402`, `423`, `404`. Other `4xx`/`3xx`:
   configuration.
 - Migration invalidates the legacy token at once; the identical request within
   7 days returns the same pair. Responses may omit `scope`.
@@ -79,19 +82,28 @@ Shopify
   revoked; a refresh sent with the new secret pins the shop's token to it;
   webhooks are signed with the oldest unrevoked secret. The Dev Dashboard's
   rotation refresh token re-pins legacy tokens only and needs the current
-  token. Revoking a secret kills the access tokens pinned to it; whether
-  refresh tokens issued under it still refresh with the new secret is
-  undocumented (to be found by rehearsal). Shopify publishes no rate limit or
-  pacing for the token endpoint.
+  token. Revoking a secret kills the access tokens pinned to it, but refresh
+  tokens issued under it still refresh with the new secret, so every chain
+  recovers on its next refresh. Replaying a presented refresh token with the
+  other secret returns the same pair, still pinned to the secret it was first
+  sent with. Shopify publishes no rate limit or pacing for the token endpoint.
 - Application-only tokens ([docs][app-only]): `client_credentials` with a JWT
   `client_assertion` (ES256 or RS256; `iss` = `sub` = client id, `aud` the
   shop's token URL, `exp` ≤ 300 s after `iat`, each `jti` accepted once per
   app), form-encoded, no client secret. Public-distribution apps only, on
   stores that installed them. The token lasts ≤ 1 h, has no refresh token,
-  carries every granted scope, and may be the one issued earlier that minute.
-  Revoking the secret doesn't affect it; revoking its public key (at most two
-  are active) ends it, as does an uninstall. Token exchange and refresh accept
-  only the client secret. No documented error codes or rate limit.
+  carries every granted scope (write scopes imply their read scopes), and a
+  second mint with the same key within the minute returns the same token; each
+  key gets its own. A replayed assertion answers `401 invalid_client`, as does
+  an unregistered or revoked key. Revoking the secret doesn't affect it;
+  revoking its public key (at most two are active) ends it at once, as does an
+  uninstall. Token exchange and refresh accept only the client secret. No
+  documented error codes or rate limit.
+
+Checked against a dev store on 2026-11-10 with `scripts/rehearsal` (its README
+lists each check). Not checked: the exchange retiring other refresh tokens,
+the 30-day and 7-day windows, webhook signing, the 2027 `403`, the rotation
+refresh token, the two-key limit and rate limits.
 
 [app-only]: https://shopify.dev/docs/apps/build/authentication-authorization/application-only-access-tokens
 
@@ -112,6 +124,7 @@ Entry points
 - `.` — `DurableObjectSessionStorage`, `migrateLegacySessions`,
   `rolloverShops`, `validateKeyring`, types. **No `cloudflare:workers` import.**
 - `./durable-object` — `createShopSessionsDurableObject`.
+- `./workflow` — `createRotateSecretsWorkflow` (§7.3), `rotationKeys`, types.
 
 Peer `@shopify/shopify-api` `^15.0.0`. No runtime dependencies.
 
@@ -126,6 +139,8 @@ Source
 - `src/durable-object.ts` DurableObject shell.
 - `src/adapter.ts`, `src/backfill.ts`, `src/rollover.ts`, `src/types.ts`
   (shared contracts).
+- `src/rotation.ts` the rotation flows (§7.3; the step and failure type are
+  injected, so Node-testable); `src/workflow.ts` its Workflow shell.
 
 ## 4. Public API
 
@@ -596,8 +611,47 @@ Uses: staged migration (§8); planned secret rotation (deploy the new secret,
 sweep, revoke once nothing is unrolled); leaked storage or refresh tokens (two
 passes: Shopify keeps a presented refresh token usable until its replacement
 is presented, so the second pass retires the leaked ones); keyring rotation
-(one pass reseals); after an emergency revoke (works only if old refresh
-tokens survive the revoke, §2).
+(one pass reseals); after an emergency revoke (old refresh tokens survive the
+revoke, §2, so a pass brings every live shop back).
+
+### 7.3 Rotation workflow
+
+`createRotateSecretsWorkflow({ registry, namespace, legacyKv?, locationHint?,
+allowMyshopifyIo?, report? })` returns a `WorkflowEntrypoint` class; the flows
+are `runRotation(params, step, deps)` in `src/rotation.ts`, with `step` and
+`fatal` (`NonRetryableError`) injected. Params: `{ kind: 'keyring' |
+'api-secret', canaryShop, stages? }`. Full design: `spec.secret-rotation.md`.
+
+- Operators put secrets; the Workflow holds none, and no step output or event
+  carries one. Each deploy is checked against a `before` snapshot of the
+  canary's `describe().keyring.kids` / `credentials.credFp`: unchanged retries
+  (propagation) then fails; any other unexpected shape fails at once.
+- Lock `shop-sessions:rotation:<kind>:lock` in the registry KV (the instance
+  id): one rotation per kind. A failed instance keeps it.
+- Passes call `rolloverShops` directly, one bounded run per step, under
+  `shop-sessions:rotation:<kind>:request` / `:state`, never the cron's keys.
+  `running` → next run; `throttled` → sleep 5 min; `halted` → wait for
+  `resume-<label>`, rewrite the request; `idle`/`invalid_request` → fail; at
+  most 500 runs per pass.
+- Keyring: `keyring-deployed` → live kids must be `[new, ...before]` →
+  canary rolls and is sealed only under the new kid → sleep 90 days → census
+  of every registry shop (`describe`, 200 per step) for kids other than the
+  new one → roll those in `ok`/`failing` (50 per step); the rest, and any that
+  didn't answer `rolled`/`current`, are stragglers (≤ 1000 listed plus the
+  total) → keyring unchanged since → `approve-drop` → `keyring-dropped` → no
+  dropped kid live, new kid live, canary not `unreadable`.
+- API secret: stages strictly increasing positive integers (default
+  `[10, 200]`, checked before the lock), then a full pass →
+  `api-secret-deployed` → `credFp` changed → canary rolls (a configuration
+  failure is fatal) → sleep 10 min → one cutoff for every stage →
+  `approve-after-<n>` after each stage → stragglers: the final pass's
+  `unrolled` minus `none`, counted per shop (not from `outcomes`, which count
+  redone pages twice), and any `offline_*` key in `legacyKv` → if any,
+  `ack-stragglers` → `api-secret-revoked` → canary rolls and is `ok`.
+- Event waits time out after 7–30 days; a timeout fails the instance.
+- `keyringRetention` (default `90 days`) shortens the keyring wait for staging
+  rehearsals only. Both flows ran on a deployed staging Worker against a dev
+  store (`scripts/staging`, spec "Verified").
 
 ## 8. App integration
 
@@ -720,3 +774,7 @@ tokens survive the revoke, §2).
    shop's chain can't produce one. The record gains `fallback`,
    `mintRejected` and `appTokenFps`; nothing else in stored data changes, and without the option
    behavior is unchanged.
+2. `describe` reports the object's live configuration: `keyring.kids` (current
+   first) and `credentials.credFp`. The optional rotation Workflow (§7.3,
+   `./workflow`) checks deploys against them.
+3. A refresh `401 invalid_grant` is terminal (§2), as `401 invalid_request` was.

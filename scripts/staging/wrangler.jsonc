@@ -1,0 +1,18 @@
+// Staging Worker for the rotation Workflow rehearsal (scripts/staging/README.md). Not an app.
+{
+  "name": "shop-sessions-staging",
+  "main": "./worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "SHOP_SESSIONS", "class_name": "ShopSessions" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShopSessions"] }],
+  // Fill in with: pnpm staging:kv (prints the id).
+  "kv_namespaces": [{ "binding": "SESSION", "id": "REPLACE_WITH_KV_ID" }],
+  "workflows": [{ "name": "rotate-secrets-staging", "binding": "ROTATE_SECRETS", "class_name": "RotateSecrets" }],
+  "observability": { "enabled": true },
+  // A rehearsal can't wait 90 days for the keyring flow's census.
+  "vars": { "KEYRING_RETENTION": "2 minutes" },
+}

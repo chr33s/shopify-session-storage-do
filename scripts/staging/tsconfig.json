@@ -1,0 +1,5 @@
+{
+  // The staging Worker runs in workerd: Workers types, like src/.
+  "extends": "../../tsconfig.json",
+  "include": ["worker.ts"]
+}

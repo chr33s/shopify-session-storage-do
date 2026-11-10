@@ -1,0 +1,23 @@
+{
+  // Scripts run on Node's built-in type stripping, so only erasable syntax is allowed and imports keep their
+  // real extensions. Node types here, not the Workers types the package uses.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["**/*.ts"],
+  // The staging Worker has its own (Workers) config.
+  "exclude": ["staging/worker.ts"]
+}

@@ -3,3 +3,8 @@ dist
 coverage
 .wrangler
 *.tgz
+.env
+.env.*
+.rehearsal/
+*.pem
+*.jwk.json

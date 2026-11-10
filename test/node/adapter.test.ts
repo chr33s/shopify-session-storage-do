@@ -664,7 +664,15 @@ describe('deleteShop', () => {
 
 describe('describe', () => {
   it('passes the object’s status through', async () => {
-    const status: ShopSessionStatus = { shop: SHOP, exists: true, state: 'ok', source: 'refresh', nextAlarmAt: null }
+    const status: ShopSessionStatus = {
+      shop: SHOP,
+      exists: true,
+      state: 'ok',
+      source: 'refresh',
+      nextAlarmAt: null,
+      keyring: { kids: ['kid-a'] },
+      credentials: { credFp: 'fp' },
+    }
     const { storage, calls } = storageFor({ describe: () => status })
     expect(await storage.describe('COOL-SHOP.myshopify.com')).toEqual(status)
     expect(calls[0]).toMatchObject({ shop: SHOP, method: 'describe', input: { shop: SHOP } })

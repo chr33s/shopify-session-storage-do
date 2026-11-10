@@ -26,6 +26,10 @@
     "./durable-object": {
       "types": "./dist/durable-object.d.ts",
       "import": "./dist/durable-object.js"
+    },
+    "./workflow": {
+      "types": "./dist/workflow.d.ts",
+      "import": "./dist/workflow.js"
     }
   },
   "files": [
@@ -38,13 +42,18 @@
   "packageManager": "pnpm@12.4.2",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p test/workers/tsconfig.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/workers/tsconfig.json && tsc --noEmit -p scripts/tsconfig.json && tsc --noEmit -p scripts/staging/tsconfig.json",
     "test": "vitest --project node",
     "test:workers": "vitest --project workers --project workers-current",
     "test:all": "vitest run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepare": "pnpm run build"
+    "prepare": "pnpm run build",
+    "rehearsal": "pnpm run build && node scripts/rehearsal/verify-shopify.ts",
+    "app-token-key": "node scripts/generate-app-token-key.ts",
+    "staging": "node scripts/staging/operate.ts",
+    "staging:deploy": "wrangler deploy -c scripts/staging/wrangler.jsonc",
+    "staging:kv": "wrangler kv namespace create SESSION -c scripts/staging/wrangler.jsonc"
   },
   "peerDependencies": {
     "@shopify/shopify-api": "^15.0.0"
@@ -53,8 +62,10 @@
     "@cloudflare/vitest-plugin": "^1.4.7",
     "@cloudflare/workers-types": "^5.20261021.1",
     "@shopify/shopify-api": "^15.0.1",
+    "@types/node": "^22.20.5",
     "prettier": "^3.9.10",
     "typescript": "~5.9.3",
-    "vitest": "~4.1.12"
+    "vitest": "~4.1.12",
+    "wrangler": "4.152.0"
   }
 }

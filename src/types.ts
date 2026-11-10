@@ -192,6 +192,10 @@ export type ShopSessionStatus = {
   /** A mint Shopify rejected under this signing key; none is tried until the key or the chain changes. */
   mintRejected?: { kid: string; since: number }
   nextAlarmAt?: number | null
+  /** The live keyring's kids, current first: what the object seals and opens with now. Not secret. */
+  keyring: { kids: string[] }
+  /** The live credential fingerprint (apiKey + apiSecretKey, DESIGN.md §5). Not secret. */
+  credentials: { credFp: string }
 }
 
 /** Methods every ShopSessions Durable Object exposes over RPC. */
@@ -305,6 +309,8 @@ export interface AppTokenClient {
 
 export interface Keyring {
   readonly currentKid: string
+  /** Every key's kid, current first. */
+  readonly kids: readonly string[]
   seal(plaintext: string, aad: string): Promise<Sealed>
   /** `undefined` when the kid isn't in the keyring or authentication fails. */
   open(sealed: Sealed, aad: string): Promise<string | undefined>

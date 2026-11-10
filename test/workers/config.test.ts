@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 import { createKeyring } from '../../src/crypto.js'
 import type { ShopSessionsDurableObject } from '../../src/durable-object.js'
-import { fingerprint } from '../../src/fingerprint.js'
+import { credentialFingerprint, fingerprint } from '../../src/fingerprint.js'
 import type { ShopRecord } from '../../src/types.js'
 import { DAY, HOUR, MINUTE, clock, fake, installShop, newShop, stubFor, useFreshFake } from './helpers.js'
 import type { Stub } from './helpers.js'
@@ -117,6 +117,16 @@ describe('encryption keys', () => {
       session: { accessToken: 'shpat_older' },
     })
     expect(await stub.describe({ shop })).toMatchObject({ state: 'ok', kids: [sealer.currentKid] })
+  })
+
+  it('describe reports the live keyring and credentials, which a rotation checks a deploy against', async () => {
+    const live = await createKeyring(env.SHOPIFY_SESSION_ENCRYPTION_KEYS)
+    const shop = newShop('live-config')
+    const status = await stubFor(shop).describe({ shop })
+    expect(status.exists).toBe(false)
+    expect(status.keyring).toEqual({ kids: [...live.kids] })
+    expect(status.keyring.kids).toHaveLength(2)
+    expect(status.credentials.credFp).toBe(await credentialFingerprint(env.SHOPIFY_API_KEY, env.SHOPIFY_API_SECRET))
   })
 })
 

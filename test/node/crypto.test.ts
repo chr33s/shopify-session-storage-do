@@ -304,6 +304,14 @@ describe('createKeyring', () => {
     expect(keyring.currentKid).toBe(await expectedKid(key))
   })
 
+  it('lists every kid, current first', async () => {
+    const a = newKey()
+    const b = newKey()
+    const keyring = await createKeyring(`${b},${a}`)
+    expect(keyring.kids).toEqual([await expectedKid(b), await expectedKid(a)])
+    expect(keyring.kids[0]).toBe(keyring.currentKid)
+  })
+
   it('keeps the kid stable per key and distinct across keys', async () => {
     const a = newKey()
     const b = newKey()
