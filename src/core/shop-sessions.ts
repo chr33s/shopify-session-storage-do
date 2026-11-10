@@ -1158,7 +1158,11 @@ export class ShopSessions implements ShopSessionsRpc {
     this.assertShop(input.shop)
     const view = await this.load()
     const nextAlarm = view.record ? await this.deps.alarm.get() : null
-    return describeRecord(this.deps.shop, view.record, nextAlarm, view.unreadable)
+    return {
+      ...describeRecord(this.deps.shop, view.record, nextAlarm, view.unreadable),
+      keyring: { kids: [...this.deps.keyring.kids] },
+      credentials: { credFp: this.deps.credFp },
+    }
   }
 
   // -------------------------------------------------------------------------

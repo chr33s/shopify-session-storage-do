@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Optional secret-rotation Workflow, `createRotateSecretsWorkflow` from the new
+  `./workflow` entry. It rotates the keyring or the Shopify client secret as one
+  durable, gated process. Operators put the secrets; the Workflow checks each
+  deploy, runs staged rollover passes under its own keys, reports stragglers,
+  and waits for an explicit event before the drop or the revoke. See README
+  "Rotating secrets with a Workflow".
+- `describe` also reports the object's live configuration: `keyring.kids`
+  (current first) and `credentials.credFp`. Neither is secret.
+
 - Fix: a dead refresh token now quarantines the shop. Shopify answers it with
   `401 invalid_grant`, which was classified as a configuration failure (backoff,
   never quarantined, and counted toward a rollover halt); only

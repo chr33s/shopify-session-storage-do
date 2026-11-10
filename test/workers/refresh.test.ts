@@ -1,4 +1,4 @@
-import { abortAllDurableObjects, evictDurableObject } from 'cloudflare:test'
+import { abortAllDurableObjects, evictDurableObject, runDurableObjectAlarm } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -127,6 +127,37 @@ describe('instance loss during a refresh', () => {
     expect(await accessToken(stubFor(shop), shop)).toBe(issued.accessToken)
     expect(fake.callsFor(shop, 'refresh').map((call) => call.presented)).toEqual([pair.refreshToken, pair.refreshToken])
     expect(fake.isLive(issued.refreshToken)).toBe(true)
+  })
+})
+
+describe('a refresh lost to a deploy', () => {
+  // The rotation's 10-minute settle (spec.secret-rotation.md, API-secret step 5) relies on this: the alarm, armed
+  // before the call is sent, replays it with no caller.
+  it('is replayed by the alarm within a minute of the lost call', async () => {
+    const shop = newShop('deploy-lost')
+    const { stub, pair } = await installShop(shop, 2 * MINUTE)
+    const hold = fake.hold(shop)
+
+    const waiting = stub.getSession({ shop, caller: 'library' }).catch((error: unknown) => error)
+    await hold.waitReached()
+    const sentAt = clock.now()
+    // The deploy: the instance goes away with the call in flight, and Shopify's answer never reaches it.
+    await abortAllDurableObjects()
+    expect(await waiting).toBeInstanceOf(Error)
+    hold.release()
+
+    const next = stubFor(shop)
+    expect(await next.describe({ shop })).toMatchObject({ attemptPending: true })
+    const { alarm } = await inspect(next)
+    expect(alarm).not.toBeNull()
+    expect(alarm!).toBeLessThanOrEqual(sentAt + MINUTE)
+
+    expect(await runDurableObjectAlarm(next)).toBe(true)
+    const replayed = fake.lastPair(shop)
+    expect(fake.callsFor(shop, 'refresh').map((call) => call.presented)).toEqual([pair.refreshToken, pair.refreshToken])
+    expect(await next.describe({ shop })).toMatchObject({ state: 'ok', source: 'refresh' })
+    expect((await next.describe({ shop })).attemptPending).toBeUndefined()
+    expect(await accessToken(next, shop)).toBe(replayed.accessToken)
   })
 })
 

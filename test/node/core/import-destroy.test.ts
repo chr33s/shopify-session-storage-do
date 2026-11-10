@@ -408,11 +408,14 @@ describe('destroy', () => {
 describe('describe', () => {
   it('describes a missing, healthy, failing and unreadable record without secrets', async () => {
     const h = createHarness()
+    // The live configuration comes with every answer, a record or not (spec.secret-rotation.md, P3).
+    const live = { keyring: { kids: ['kid-a'] }, credentials: { credFp: CRED_FP } }
     expect(await h.core.describe({ shop: SHOP })).toEqual({
       shop: SHOP,
       exists: false,
       state: 'none',
       nextAlarmAt: null,
+      ...live,
     })
     await h.seed({ scope: 's', alternates: ['alt-1'] })
     h.alarm.at = h.clock.now() + DAY
@@ -424,6 +427,7 @@ describe('describe', () => {
       alternates: 1,
       kids: ['kid-a'],
       nextAlarmAt: h.clock.now() + DAY,
+      ...live,
     })
     h.store.record!.failures = {
       count: 2,
@@ -445,8 +449,10 @@ describe('describe', () => {
     h.keyring.unknownKids.add('kid-a')
     const unreadable = await h.core.describe({ shop: SHOP })
     expect(unreadable.state).toBe('unreadable')
+    expect(unreadable).toMatchObject(live)
+    // credFp is a truncated hash of a high-entropy secret, so it is shown; tokens never are.
     const text = JSON.stringify([status, unreadable])
-    for (const secret of ['access-1', 'refresh-1', 'alt-1', CRED_FP]) expect(text).not.toContain(secret)
+    for (const secret of ['access-1', 'refresh-1', 'alt-1']) expect(text).not.toContain(secret)
   })
 
   it('rejects another shop', async () => {

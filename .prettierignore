@@ -3,3 +3,4 @@ pnpm-lock.yaml
 .wrangler
 # Hand-formatted spec: Prettier would re-nest its paragraphs into the lists above them.
 DESIGN.md
+.rehearsal

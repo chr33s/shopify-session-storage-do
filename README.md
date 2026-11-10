@@ -90,11 +90,12 @@ Requirements:
   than errors, so it doesn't rely on newer runtime behaviour. It is tested at
   `2024-09-23` and a current date (RPC needs `2024-04-03` or later).
 
-There are no runtime dependencies. The package has two entry points: `.` (the
-storage adapter, the backfill, `validateKeyring` and types) never imports
-`cloudflare:workers`, so `shopify.server.ts` and Node tests can load it;
-`./durable-object` holds the Durable Object and is imported only by the Worker
-entry.
+There are no runtime dependencies. The package has three entry points. `.`
+(the storage adapter, the backfill, `validateKeyring` and types) never imports
+`cloudflare:workers`, so `shopify.server.ts` and Node tests can load it.
+`./durable-object` holds the Durable Object, and `./workflow` holds the optional
+[rotation Workflow](#rotating-secrets-with-a-workflow); only the Worker entry
+imports them.
 
 ## Usage
 
@@ -491,6 +492,9 @@ material.
    a record still uses; describe the shops in the registry before removing
    one.
 
+The [rotation Workflow](#rotating-secrets-with-a-workflow) runs these steps,
+including the 90-day wait and the check before the drop.
+
 A record sealed under a removed key is not deleted: it answers `tokenless` to
 the library (the next admin request exchanges and replaces it) and
 `unavailable('unreadable')` to background code. Putting the key back fixes it.
@@ -571,19 +575,99 @@ When to run one:
   secret when it refreshes. Revoke the old secret only once `unrolled` is
   empty. The app must accept webhooks signed with either secret meanwhile
   (Shopify signs with the oldest unrevoked one), which the package doesn't
-  cover.
+  cover. The [rotation Workflow](#rotating-secrets-with-a-workflow) runs this
+  with stages and approvals.
 - **Leaked storage or refresh tokens:** two passes, the second with an
   `obtainedBefore` after the first finished. Shopify keeps a presented refresh
   token usable until its replacement is presented, so only the second pass
   retires the leaked ones. Leaked access tokens live out their hour.
 - **After rotating the keyring:** one pass reseals every live shop.
-- **After an emergency revoke:** whether refresh tokens issued under the old
-  secret still work with the new one is unverified. If they do, a pass brings
-  background work back for every shop; if not, shops recover as merchants open
-  the app.
+- **After an emergency revoke:** refresh tokens issued under the old secret
+  still refresh with the new one (rehearsed on a dev store), so a pass brings
+  background work back for every shop at once instead of waiting for each
+  shop's alarm.
 
 `rollover(shop, { obtainedBefore })` on the storage does the same for one shop
 and returns its answer.
+
+### Rotating secrets with a Workflow
+
+`createRotateSecretsWorkflow` (from `./workflow`) runs the two rotations above
+(the keyring and the Shopify client secret) as one durable, gated
+[Cloudflare Workflow](https://developers.cloudflare.com/workflows/). Operators
+still put the secrets. The Workflow checks each deploy against a snapshot it
+took before, runs the rollover passes under its own KV keys, and waits for an
+explicit event before every irreversible step. It holds no secret, and no step
+output or event carries one. The design is in `spec.secret-rotation.md`.
+
+```ts
+// Worker entry
+import { createRotateSecretsWorkflow } from '@optizio/shopify-session-storage-do/workflow'
+
+export const RotateSecrets = createRotateSecretsWorkflow<Env>({
+  registry: (env) => ({ kv: env.SESSION }), // the Durable Object's registry
+  namespace: (env) => env.SHOP_SESSIONS,
+  legacyKv: (env) => env.SESSION, // while legacy `offline_*` sessions may remain; leave out otherwise
+})
+```
+
+```toml
+# Workflow names are global per account, and bindings aren't inherited: one per environment.
+[env.production]
+workflows = [{ name = "rotate-secrets-production", binding = "ROTATE_SECRETS", class_name = "RotateSecrets" }]
+```
+
+It needs Workers Paid. On the Free plan, a Workflow step gets 10 ms of CPU and an
+instance 1,024 steps, and a rollover run needs more. At most 5 stages are
+allowed, which keeps a rotation near 3,000 of the 10,000 steps an instance gets.
+
+Start a rotation with `env.ROTATE_SECRETS.create({ params: { kind, canaryShop } })`,
+and send each event from an authenticated operator route with
+`(await env.ROTATE_SECRETS.get(id)).sendEvent({ type, payload: {} })`. The
+canary must be a live, non-legacy shop (`describe` answers `state: 'ok'`).
+`wrangler workflows instances describe` shows each step's output, including the
+stragglers.
+
+**Keyring** (`kind: 'keyring'`):
+
+1. Generate and escrow the key, put `new,old` in one `wrangler secret put`,
+   then send `keyring-deployed`. The Workflow checks that the live kids are
+   exactly the new one followed by the old ones, and that the canary reseals.
+2. After 90 days it describes every registry shop, rolls the live ones still on
+   an old key, and lists the rest (legacy, quarantined, unreadable). Then it
+   checks that the keyring hasn't changed since and waits for `approve-drop`.
+3. Put the keyring without the old keys, then send `keyring-dropped`. The
+   Workflow checks the drop and finishes with
+   `{ newKid, dropKids, stragglers }`.
+
+**Client secret** (`kind: 'api-secret'`, optional `stages`, default `[10, 200]`):
+
+1. Before anything else, deploy the app so that it accepts webhooks and session
+   tokens signed with either secret (`SHOPIFY_API_SECRET_PREVIOUS`). Shopify
+   signs webhooks with the oldest unrevoked secret; the package doesn't
+   verify them.
+2. Generate the new secret in the Dev Dashboard, then run **one**
+   `wrangler secret bulk` with `SHOPIFY_API_SECRET=new` and
+   `SHOPIFY_API_SECRET_PREVIOUS=old`. Two `secret put` commands would deploy
+   twice. Send `api-secret-deployed`. The Workflow checks that the live
+   credentials changed and that the canary refreshes with them.
+3. It waits 10 minutes, so that refreshes cut off by the deploy replay first,
+   then runs a rollover pass per stage. After each stage `n` it waits for
+   `approve-after-n`, then runs a full pass. A halted pass waits for
+   `resume-stage-n` (or `resume-stage-all`).
+4. If shops didn't roll, or legacy `offline_*` sessions remain, it waits for
+   `ack-stragglers`. Revoking kills those shops' access tokens. Expiring-token
+   shops recover on their next refresh, because refresh tokens survive the
+   revoke; legacy shops don't.
+5. Revoke the old secret in the Dev Dashboard and send `api-secret-revoked`.
+   The Workflow checks that the canary still refreshes. Then remove
+   `SHOPIFY_API_SECRET_PREVIOUS`.
+
+Each wait has a timeout (7 to 30 days), and a timed-out or failed instance
+stops. `keyringRetention: (env) => '2 minutes'` shortens the keyring flow's
+90-day wait, for a rehearsal on a staging Worker only (`scripts/staging`). One rotation per kind runs at a time, under
+`shop-sessions:rotation:<kind>:lock` in the registry KV. A failed instance
+keeps its lock, so delete the lock by hand after investigating.
 
 ### Listing shops
 
@@ -601,8 +685,11 @@ its token works; KV listings are eventually consistent.
 token and refresh-token expiry, `pairObtainedAt`, `tokenInvalid`,
 `attemptPending` (a token call was sent and its outcome isn't stored yet), the
 number of alternates, `kids`, `needsReauth`, `failures` (count, kind, code,
-since, retryAt, ambiguous) and `nextAlarmAt`. Expose it only through an authenticated
-operator route.
+since, retryAt, ambiguous) and `nextAlarmAt`. It also reports the object's live
+configuration: `keyring.kids` (the deployed keyring's kids, current first) and
+`credentials.credFp` (a truncated SHA-256 of the API key and secret). Neither is
+secret. Both show what a deploy changed, which the rotation Workflow checks.
+Expose `describe` only through an authenticated operator route.
 
 ### Quarantine and failures
 

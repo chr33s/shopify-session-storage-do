@@ -27,6 +27,9 @@
   "kv_namespaces": [
     { "binding": "REGISTRY", "id": "registry" },
     { "binding": "LEGACY", "id": "legacy" },
+    // The rotation Workflow's registry: only the rotation test's shops, so its sweeps don't reach other tests'.
+    { "binding": "ROTATION_REGISTRY", "id": "rotation-registry" },
   ],
+  "workflows": [{ "name": "rotate-secrets-test", "binding": "ROTATE_SECRETS", "class_name": "TestRotateSecrets" }],
   "vars": { "SHOPIFY_API_KEY": "test-api-key" },
 }

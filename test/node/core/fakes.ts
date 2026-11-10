@@ -118,6 +118,9 @@ const decoder = new TextDecoder()
  */
 export class FakeKeyring implements Keyring {
   currentKid = 'kid-a'
+  get kids(): string[] {
+    return [this.currentKid]
+  }
   unknownKids = new Set<string>()
   seals: { kid: string; aad: string }[] = []
   opens: { kid: string; aad: string }[] = []
