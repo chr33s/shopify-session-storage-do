@@ -11,6 +11,7 @@
       { "name": "BROKEN_KEYRING", "class_name": "BrokenKeyringShopSessions" },
       { "name": "NO_CREDENTIALS", "class_name": "NoCredentialsShopSessions" },
       { "name": "APP_TOKENS", "class_name": "AppTokenShopSessions" },
+      { "name": "APP_TOKEN_PRIMARY", "class_name": "AppTokenPrimaryShopSessions" },
     ],
   },
   "migrations": [
@@ -22,6 +23,10 @@
         "NoCredentialsShopSessions",
         "AppTokenShopSessions",
       ],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["AppTokenPrimaryShopSessions"],
     },
   ],
   "kv_namespaces": [

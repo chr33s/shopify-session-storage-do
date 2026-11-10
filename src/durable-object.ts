@@ -15,6 +15,7 @@ import type {
   AlarmControl,
   AlarmErrors,
   AppTokenKey,
+  AppTokenMode,
   CoreDeps,
   DescribeInput,
   DestroyInput,
@@ -23,6 +24,8 @@ import type {
   GetSessionResult,
   ImportLegacyInput,
   ImportLegacyResult,
+  InvalidateAndRefreshInput,
+  InvalidateAndRefreshResult,
   KVNamespaceLike,
   PutSessionInput,
   PutSessionResult,
@@ -35,17 +38,19 @@ import type {
   ShopRecord,
   ShopSessionStatus,
   ShopSessionsRpc,
+  TokenCallResult,
+  TokenClient,
 } from './types.js'
 
 export { ShopSessionError } from './types.js'
-export type { AppTokenKey, ReportContext, ShopSessionsRpc } from './types.js'
+export type { AppTokenKey, AppTokenMode, ReportContext, ShopSessionsRpc } from './types.js'
 
 export type ShopSessionsDurableObjectOptions<Env> = {
   /** The KV namespace for installed-shop markers. Prefix defaults to `shop-session:`. */
   registry: (env: Env) => { kv: KVNamespaceLike; prefix?: string }
   /** Defaults to `env.SHOPIFY_API_KEY`. */
   apiKey?: (env: Env) => string | undefined
-  /** Defaults to `env.SHOPIFY_API_SECRET`. */
+  /** Defaults to `env.SHOPIFY_API_SECRET`. Optional when `appTokenMode` is `primary`. */
   apiSecretKey?: (env: Env) => string | undefined
   /** Comma-separated base64 AES-256 keys, current first. Defaults to `env.SHOPIFY_SESSION_ENCRYPTION_KEYS`. */
   encryptionKeys?: (env: Env) => string | undefined
@@ -54,11 +59,15 @@ export type ShopSessionsDurableObjectOptions<Env> = {
   /** Whether the alarm upgrades legacy tokens to expiring ones. Read every time it is needed; default false. */
   migrateLegacy?: (env: Env) => boolean
   /**
-   * The private key for application-only tokens, whose public JWK is registered on the app. When set,
-   * `loadOfflineSession` answers with an app token while the shop's refresh-token chain can't produce one. Read when
-   * the instance starts; undefined turns the fallback off.
+   * Private key for application-only tokens (its public JWK registered on the app). In `fallback` mode,
+   * `loadOfflineSession` serves an app token while the refresh-token chain can't produce one; in `primary` mode,
+   * every offline load comes from an app-token cache. Read when the instance starts.
    */
   appTokenKey?: (env: Env) => AppTokenKey | undefined
+  /** Defaults to `fallback`. `primary` requires `appTokenKey` (DESIGN.md §6.11). */
+  appTokenMode?: AppTokenMode | ((env: Env) => AppTokenMode | undefined)
+  /** Primary mode: a cached token from another `signingKid` is a miss, so rolling the JWK remints at once. */
+  strictSigningKid?: boolean | ((env: Env) => boolean)
   /** When legacy tokens stop being served (ms epoch). Defaults to 2027-01-01T00:00:00Z. */
   legacyCutoff?: number
   /** Accept `*.myshopify.io` shops. Must match the adapter's setting. */
@@ -118,6 +127,10 @@ export function createShopSessionsDurableObject<Env>(
 
     async reportUnauthorized(input: ReportUnauthorizedInput): Promise<ReportUnauthorizedResult> {
       return (await this.shell.rpcCore(input)).reportUnauthorized(input)
+    }
+
+    async invalidateAndRefresh(input: InvalidateAndRefreshInput): Promise<InvalidateAndRefreshResult> {
+      return (await this.shell.rpcCore(input)).invalidateAndRefresh(input)
     }
 
     async destroy(input: DestroyInput): Promise<DestroyResult> {
@@ -244,8 +257,9 @@ class Shell<Env> {
     const keys = options.encryptionKeys
       ? options.encryptionKeys(env)
       : envString(env, 'SHOPIFY_SESSION_ENCRYPTION_KEYS')
+    const appTokenMode = resolveAppTokenMode(options.appTokenMode, env)
     if (!present(apiKey)) this.fail(shop, 'missing_api_key', 'The app API key (SHOPIFY_API_KEY) is missing or empty')
-    if (!present(apiSecretKey)) {
+    if (appTokenMode !== 'primary' && !present(apiSecretKey)) {
       this.fail(shop, 'missing_api_secret', 'The app API secret (SHOPIFY_API_SECRET) is missing or empty')
     }
     const registry = options.registry(env)
@@ -261,8 +275,12 @@ class Shell<Env> {
     }
     const now = this.now.bind(this)
     const http = { apiKey, fetch: options.fetch, now, allowMyshopifyIo: options.allowMyshopifyIo === true }
-    const tokens = createTokenClient({ ...http, apiSecretKey })
-    const credFp = await credentialFingerprint(apiKey, apiSecretKey)
+    const tokens: TokenClient = present(apiSecretKey)
+      ? createTokenClient({ ...http, apiSecretKey })
+      : unavailableTokenClient()
+    const credFp = present(apiSecretKey)
+      ? await credentialFingerprint(apiKey, apiSecretKey)
+      : await credentialFingerprint(apiKey, `app-token:${appTokenMode}`)
     let appTokens: CoreDeps['appTokens']
     try {
       const appTokenKey = options.appTokenKey?.(env)
@@ -270,10 +288,17 @@ class Shell<Env> {
         appTokens = createAppTokenClient({ ...http, signer: await createAssertionSigner(apiKey, appTokenKey) })
       }
     } catch (error) {
-      // The fallback is optional: a broken key, or an appTokenKey(env) that throws, turns it off but must not take the
-      // chain down. Key errors never contain key material; anything else is named by its type only.
+      // Fallback mode: a broken key turns the fallback off but must not take the chain down. Primary mode fails hard.
       const reason = error instanceof AppTokenKeyError ? error.message : `appTokenKey(env) threw ${errorName(error)}`
+      if (appTokenMode === 'primary') this.fail(shop, 'app_token_key', reason)
       this.reportAppTokenKey(shop, reason)
+    }
+    if (appTokenMode === 'primary' && !appTokens) {
+      this.fail(
+        shop,
+        'missing_app_token_key',
+        'appTokenMode is primary but appTokenKey is missing or could not be loaded',
+      )
     }
 
     // The object is named after its shop; a record for another shop means it was addressed wrongly once already.
@@ -302,12 +327,18 @@ class Shell<Env> {
         else await storage.delete(ALARM_ERROR_KEY)
       },
     }
+    const strictSigningKid =
+      typeof options.strictSigningKid === 'function'
+        ? options.strictSigningKid(env) === true
+        : options.strictSigningKid === true
     const deps: CoreDeps = {
       shop,
       store,
       alarm,
       tokens,
       appTokens,
+      appTokenMode,
+      strictSigningKid,
       keyring,
       credFp,
       registry: { kv: registry.kv, prefix: registry.prefix ?? DEFAULT_REGISTRY_PREFIX },
@@ -382,4 +413,23 @@ function present(value: unknown): value is string {
 
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : typeof error
+}
+
+function resolveAppTokenMode(
+  value: AppTokenMode | ((env: never) => AppTokenMode | undefined) | undefined,
+  env: unknown,
+): AppTokenMode {
+  const resolved = typeof value === 'function' ? value(env as never) : value
+  return resolved === 'primary' ? 'primary' : 'fallback'
+}
+
+/** Primary mode without a client secret: no refresh/migrate. */
+function unavailableTokenClient(): TokenClient {
+  const unavailable = async (): Promise<TokenCallResult> => ({
+    outcome: 'configuration',
+    sentAt: Date.now(),
+    ambiguous: false,
+    code: 'missing_api_secret',
+  })
+  return { refresh: unavailable, migrate: unavailable }
 }

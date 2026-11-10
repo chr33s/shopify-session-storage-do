@@ -395,8 +395,14 @@ export function failure(
 // Harness
 
 export type HarnessOptions = {
-  /** Configure the application-only token fallback. */
+  /** Enables FakeAppTokens; see `appTokenMode`. */
   appTokens?: boolean
+  /** Defaults to `fallback`. Requires `appTokens: true`. */
+  appTokenMode?: 'fallback' | 'primary'
+  /** Primary mode: treat a mismatched signing kid as a cache miss. */
+  strictSigningKid?: boolean
+  /** Primary-mode mint retry delays. Defaults to a no-op so tests stay fast. */
+  sleep?: (ms: number) => Promise<void>
   legacy?: boolean
   migrateLegacy?: boolean
   callerWaitMs?: number
@@ -407,6 +413,8 @@ export type Seed = {
   token?: string | null
   refresh?: string | null
   expires?: number | null
+  renewAfter?: number | null
+  signingKid?: string
   refreshExpires?: number | null
   alternates?: string[]
   scope?: string
@@ -417,6 +425,8 @@ export type Seed = {
   needsReauth?: ShopRecord['needsReauth']
   attemptSince?: number
   failures?: ShopRecord['failures']
+  mintRejected?: ShopRecord['mintRejected']
+  appTokenFps?: string[]
 }
 
 export function createHarness(options: HarnessOptions = {}) {
@@ -442,6 +452,8 @@ export function createHarness(options: HarnessOptions = {}) {
     alarm,
     tokens,
     appTokens,
+    appTokenMode: options.appTokenMode,
+    strictSigningKid: options.strictSigningKid,
     keyring,
     credFp: options.credFp ?? CRED_FP,
     registry: { kv: registry, prefix: 'shop-session:' },
@@ -449,6 +461,7 @@ export function createHarness(options: HarnessOptions = {}) {
     migrateLegacy: () => flags.migrateLegacy,
     legacyCutoff: CUTOFF,
     now: clock.now,
+    sleep: options.sleep ?? (async () => undefined),
     waitUntil: (promise) => {
       waits.push(promise)
     },
@@ -487,14 +500,20 @@ export function createHarness(options: HarnessOptions = {}) {
   async function seed(s: Seed = {}): Promise<ShopRecord> {
     const record: ShopRecord = { v: 1, shop: SHOP, pairObtainedAt: s.pairObtainedAt ?? clock.now() }
     const token = s.token === undefined ? 'access-1' : s.token
-    const refresh = s.refresh === undefined ? 'refresh-1' : s.refresh
+    const refresh = s.refresh === undefined ? (s.source === 'app_token' ? null : 'refresh-1') : s.refresh
     if (token !== null) {
       record.token = await sealed(token, 'token')
       record.tokenFp = await fingerprint(token)
     }
     if (s.expires !== null) {
       const expires = s.expires ?? clock.now() + HOUR
-      if (s.expires !== undefined || refresh !== null) record.expires = expires
+      if (s.expires !== undefined || refresh !== null || s.source === 'app_token') record.expires = expires
+    }
+    if (s.renewAfter !== null && (s.renewAfter !== undefined || s.source === 'app_token')) {
+      record.renewAfter = s.renewAfter ?? (record.expires ?? clock.now() + HOUR) - 5 * MIN
+    }
+    if (s.signingKid !== undefined || s.source === 'app_token') {
+      record.signingKid = s.signingKid ?? 'sig-kid-1'
     }
     if (refresh !== null) {
       record.refresh = await sealed(refresh, 'refresh')
@@ -516,6 +535,8 @@ export function createHarness(options: HarnessOptions = {}) {
     if (s.needsReauth) record.needsReauth = s.needsReauth
     if (s.attemptSince !== undefined) record.attemptSince = s.attemptSince
     if (s.failures) record.failures = s.failures
+    if (s.mintRejected) record.mintRejected = s.mintRejected
+    if (s.appTokenFps) record.appTokenFps = s.appTokenFps
     store.record = structuredClone(record)
     return record
   }

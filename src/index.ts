@@ -31,6 +31,7 @@ export type { ShopOptions } from './shop.js'
 export { DEFAULT_LOCATION_HINT, DEFAULT_REGISTRY_PREFIX, ISSUED, ShopSessionError } from './types.js'
 export type {
   AppTokenKey,
+  AppTokenMode,
   DescribeInput,
   DestroyInput,
   DestroyResult,
@@ -39,6 +40,8 @@ export type {
   GetSessionResult,
   ImportLegacyInput,
   ImportLegacyResult,
+  InvalidateAndRefreshInput,
+  InvalidateAndRefreshResult,
   IssuedTag,
   KVNamespaceLike,
   NeedsReauthReason,

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Fix (app-token primary mode): an exchange no longer lifts a mint rejection,
+  so a refused mint isn't retried on every admin load; a rejection holds
+  10 min, 4× longer per repeat, up to a day (it was a fixed day), and a mint
+  that never left (`sign_failed`) stores none; a held rejection still serves a
+  valid cached token; a failed lazy legacy import answers `tokenless
+(import_failed)`, not `none`; the install stub is no longer taken for a
+  legacy record; the alarm wipes shops rejected or quarantined for 90 days;
+  `appTokenFps` keeps 48 fingerprints; `invalidateAndRefresh` treats `''` as a
+  failed token. In fallback mode, an app-token cache left by primary mode is
+  never served to the library.
+- Fix (rotation Workflow): the lock is read back after KV propagates, so of two
+  rotations started together one fails; one shop that can't be described or
+  rolled no longer fails the census or reseal; a retried reseal batch no longer
+  rolls shops twice; `notRolled` is an exact count from a census.
+- Removed the unused `AppTokenKeyConfig`, `EncryptionKeyEntry` and
+  `DOSessionStorageConfig` types.
+
+- Fix (app-token primary mode): a mint in flight during an uninstall's
+  `destroy` no longer writes the record and marker back; a shop without a
+  record is never minted for (no stub records); `minValidityMs` is honoured;
+  a 401 write-back (tagged or untagged) of an older app token no longer evicts
+  the current one; `invalidateAndRefresh` honours the stored rejection and the
+  backoff, reports the failure's own `kind` and `code`, and fingerprints
+  outside the critical section; mints are no longer retried on `429`, `408`,
+  challenges or `Retry-After`; a short-lived token is no longer reminted on
+  every request; `rollover` remints the cache (`source: 'app_token'`), so the
+  rotation Workflow's canary and reseal work; the alarm takes back a marker for
+  a record destroyed meanwhile; re-encryption runs under `waitUntil`; the
+  registry marker is put on the first cache only.
+
 - Optional secret-rotation Workflow, `createRotateSecretsWorkflow` from the new
   `./workflow` entry. It rotates the keyring or the Shopify client secret as one
   durable, gated process. Operators put the secrets; the Workflow checks each
@@ -27,6 +57,14 @@
   the client secret. `loadSession` never gets one, so the library still
   exchanges and heals the chain. Records gain optional `fallback`,
   `mintRejected` and `appTokenFps` fields; without the option nothing changes.
+
+- App-token primary mode. With `appTokenMode: 'primary'` (and `appTokenKey`),
+  each shop's Durable Object is an ephemeral application-only token cache:
+  `loadSession` mints via `client_credentials` + JWT assertion, renews with
+  3–8 minute jitter (`renewAfter`), retries transient mint failures, and
+  exposes `invalidateAndRefresh` for Admin API 401 recovery. The client secret
+  is optional in this mode. Legacy refresh-token rows are ignored and
+  overwritten on the next load. See DESIGN.md §6.11.
 
 - Documentation for public use: a security model, an adoption checklist, a
   setup without Sentry, and guidance for apps that aren't migrating from

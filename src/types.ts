@@ -23,11 +23,19 @@ export type Sealed = { kid: string; iv: Uint8Array; ct: Uint8Array }
 
 export type SealedField = 'token' | 'refresh' | 'alternate' | 'fallback'
 
-export type TokenSource = 'exchange' | 'refresh' | 'migrate' | 'import' | 'legacy_exchange'
+export type TokenSource = 'exchange' | 'refresh' | 'migrate' | 'import' | 'legacy_exchange' | 'app_token'
 
-export type NeedsReauthReason = 'refresh_rejected' | 'legacy_rejected' | 'no_refresh_token'
+export type NeedsReauthReason = 'refresh_rejected' | 'legacy_rejected' | 'no_refresh_token' | 'app_token_rejected'
 
 export type FailureKind = 'transient' | 'shop_unavailable' | 'configuration'
+
+/**
+ * How application-only tokens are used when `appTokenKey` is configured.
+ * - `fallback` (default): mint only for `caller: 'app'` while the refresh-token chain can't produce a token (§6.10).
+ * - `primary`: the object is an app-token cache; `loadSession` mints via `client_credentials` and ignores stored
+ *   refresh tokens (DESIGN.md §6.11).
+ */
+export type AppTokenMode = 'fallback' | 'primary'
 
 export type ShopRecord = {
   v: 1
@@ -38,6 +46,13 @@ export type ShopRecord = {
   tokenFp?: string
   /** ms epoch. Absent together with `refresh` means `token` is a legacy token. */
   expires?: number
+  /**
+   * ms epoch, primary app-token cache only: renew window start, jittered 180–480 s before `expires` so fleet renewals
+   * spread out.
+   */
+  renewAfter?: number
+  /** `kid` of the key that minted the primary app token; with `strictSigningKid`, a mismatch remints at once. */
+  signingKid?: string
   refresh?: Sealed
   refreshFp?: string
   /** ms epoch. */
@@ -144,6 +159,20 @@ export type PutSessionResult = { status: 'stored' | 'merged' | 'ignored_stale' }
 export type ReportUnauthorizedInput = { shop: string; tokenFp: string }
 export type ReportUnauthorizedResult = { status: 'marked' | 'ignored_stale' }
 
+/**
+ * After an Admin API 401, evict the cached app token and mint a replacement (DESIGN.md §6.11). With
+ * `failedAccessToken`, remints only if it still matches the cache (another request may have refreshed it).
+ */
+export type InvalidateAndRefreshInput = { shop: string; failedAccessToken?: string }
+export type InvalidateAndRefreshResult =
+  | {
+      status: 'refreshed'
+      session: { shop: string; scope?: string; accessToken: string; expires?: number }
+      tokenFp: string
+    }
+  | { status: 'ignored_stale' }
+  | { status: 'failed'; kind: FailureKind | 'terminal' | 'configuration'; code: string }
+
 export type DestroyInput = { shop: string; uninstalledAt?: number }
 export type DestroyResult = { status: 'deleted' | 'kept_newer_install' }
 
@@ -159,7 +188,7 @@ export type RolloverInput = {
 export type RolloverSkipReason = 'migration_off' | 'unreadable' | 'no_refresh_token'
 
 export type RolloverResult =
-  | { status: 'rolled'; source: 'refresh' | 'migrate' }
+  | { status: 'rolled'; source: 'refresh' | 'migrate' | 'app_token' }
   | { status: 'current' }
   | { status: 'none' }
   /** Shopify rejected the shop's credentials just now; the record is quarantined. */
@@ -192,6 +221,10 @@ export type ShopSessionStatus = {
   fallback?: { kid: string; expires: number }
   /** A mint Shopify rejected under this signing key; none is tried before `retryAt` unless the key or the chain changes. */
   mintRejected?: { kid: string; since: number; retryAt: number }
+  /** Primary app-token cache: when the renew window opens (ms epoch). */
+  renewAfter?: number
+  /** Primary app-token cache: `kid` that minted the stored token. */
+  signingKid?: string
   nextAlarmAt?: number | null
   /** The live keyring's kids, current first: what the object seals and opens with now. Not secret. */
   keyring: { kids: string[] }
@@ -204,6 +237,8 @@ export interface ShopSessionsRpc {
   getSession(input: GetSessionInput): Promise<GetSessionResult>
   putSession(input: PutSessionInput): Promise<PutSessionResult>
   reportUnauthorized(input: ReportUnauthorizedInput): Promise<ReportUnauthorizedResult>
+  /** App-token primary mode (§6.11): evict a 401'd cache entry and mint again. */
+  invalidateAndRefresh(input: InvalidateAndRefreshInput): Promise<InvalidateAndRefreshResult>
   destroy(input: DestroyInput): Promise<DestroyResult>
   importLegacy(input: ImportLegacyInput): Promise<ImportLegacyResult>
   rollover(input: RolloverInput): Promise<RolloverResult>
@@ -339,8 +374,15 @@ export type CoreDeps = {
   store: RecordStore
   alarm: AlarmControl
   tokens: TokenClient
-  /** Absent when no app token key is configured: no fallback. */
+  /** Absent when no app token key is configured. */
   appTokens?: AppTokenClient
+  /** Defaults to `fallback`. `primary` requires `appTokens` (DESIGN.md §6.11). */
+  appTokenMode?: AppTokenMode
+  /**
+   * Primary mode: a cached token from another `signingKid` is a miss, so rolling the JWK remints at once. Otherwise
+   * the old kid serves until `renewAfter`.
+   */
+  strictSigningKid?: boolean
   keyring: Keyring
   /** Fingerprint of apiKey + apiSecretKey (see crypto.credentialFingerprint). */
   credFp: string
@@ -349,6 +391,8 @@ export type CoreDeps = {
   migrateLegacy: () => boolean
   legacyCutoff: number
   now: () => number
+  /** For primary-mode mint retries. Defaults to `setTimeout`. */
+  sleep?: (ms: number) => Promise<void>
   /** ctx.waitUntil */
   waitUntil: (promise: Promise<unknown>) => void
   report: (error: ShopSessionError) => void

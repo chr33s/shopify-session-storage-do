@@ -50,9 +50,22 @@ export const LONG_BACKOFF_AFTER = 7 * DAY
 export const MINT_BACKOFF = MINUTE
 /** Cap on how long a rejected mint holds off the next one under the same key and chain. */
 export const MINT_REJECTED_RECHECK = DAY
-/** The first rejection's hold; repeats under the same key hold 4× longer, up to MINT_REJECTED_RECHECK. */
+/**
+ * The first rejection's hold; repeats under the same key hold 4× longer, up to MINT_REJECTED_RECHECK. Also the most
+ * an exchange leaves standing, so a fixed cause (JWK registered after deploy) heals in minutes without a mint per
+ * request.
+ */
 export const MINT_REJECTED_HOLD = 10 * MINUTE
-export const MAX_APP_TOKEN_FPS = 5
+/** About two days of hourly primary-mode remints, so an old app token written back is still recognised. */
+export const MAX_APP_TOKEN_FPS = 48
+/** Pre-expiry renew jitter bounds: Shopify's recommended 3–8 minutes. */
+export const RENEW_JITTER_MIN_S = 180
+export const RENEW_JITTER_MAX_S = 480
+/** While a primary-mode remint fails, keep serving the cache until this close to absolute expiry. */
+export const APP_CACHE_SERVE_GRACE = 5 * SECOND
+/** Primary-mode delays before mint attempts 2–4 after transient failures. */
+export const MINT_RETRY_BACKOFF_MS = [200, 500, 1200] as const
+export const MINT_MAX_ATTEMPTS = 1 + MINT_RETRY_BACKOFF_MS.length
 
 export type TokenIntent = 'refresh' | 'migrate'
 export type DelayMode = 'interactive' | 'alarm'
@@ -113,9 +126,12 @@ export function alarmErrorDelay(count: number): number {
   return ALARM_BACKOFF[Math.min(Math.max(1, count), ALARM_BACKOFF.length) - 1] ?? LONG_BACKOFF
 }
 
-/** A legacy (non-expiring) token: no expiry and no refresh token. */
+/**
+ * A legacy (non-expiring) token: no expiry and no refresh token. Primary mode's tokenless install stub is not one:
+ * nothing to migrate or keep a KV copy for.
+ */
 export function isLegacy(record: ShopRecord): boolean {
-  return record.expires === undefined && record.refresh === undefined
+  return record.token !== undefined && record.expires === undefined && record.refresh === undefined
 }
 
 /** A legacy record whose token is still live keeps its KV copy until the migration retires it; a rejected one doesn't. */
@@ -137,7 +153,11 @@ export function attemptOutstanding(record: ShopRecord): boolean {
  */
 export function isCurrentPair(record: ShopRecord, obtainedBefore: number): boolean {
   return (
-    !isLegacy(record) && !record.needsReauth && record.source !== 'import' && record.pairObtainedAt >= obtainedBefore
+    record.token !== undefined &&
+    !isLegacy(record) &&
+    !record.needsReauth &&
+    record.source !== 'import' &&
+    record.pairObtainedAt >= obtainedBefore
   )
 }
 
@@ -219,6 +239,92 @@ export function rejectedMint(
   return { kid, since: now, first: same ? (previous.first ?? previous.since) : now, count, retryAt: now + hold }
 }
 
+/**
+ * An exchange proves the shop installed: cap the hold at MINT_REJECTED_HOLD after the last rejection so a fixed cause
+ * heals, and restart the GC episode from `now`.
+ */
+export function rejectionAfterExchange(rejected: ShopRecord['mintRejected'], now: number): ShopRecord['mintRejected'] {
+  if (!rejected) return undefined
+  return { ...rejected, first: now, retryAt: Math.min(mintRetryAt(rejected), rejected.since + MINT_REJECTED_HOLD) }
+}
+
+/**
+ * Since when a record outside the refresh-token chain has held nothing usable, for the 90-day GC. Primary mode: a
+ * quarantine left by chain mode, or a rejected mint. Fallback mode: an app-token cache left by primary mode.
+ */
+export function cacheQuarantineSince(record: ShopRecord, primary: boolean): number | undefined {
+  if (record.needsReauth) return record.needsReauth.since
+  if (!primary) return record.source === 'app_token' ? (record.expires ?? record.pairObtainedAt) : undefined
+  if (record.mintRejected) return record.mintRejected.first ?? record.mintRejected.since
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// App-token primary cache (DESIGN.md §6.11)
+
+export function isAppTokenCache(record: ShopRecord | undefined): record is ShopRecord & {
+  source: 'app_token'
+  token: Sealed
+  tokenFp: string
+  expires: number
+  renewAfter: number
+  signingKid: string
+} {
+  return (
+    record?.source === 'app_token' &&
+    record.token !== undefined &&
+    typeof record.tokenFp === 'string' &&
+    typeof record.expires === 'number' &&
+    typeof record.renewAfter === 'number' &&
+    typeof record.signingKid === 'string'
+  )
+}
+
+/** `expiresAt` minus jitter uniform in [RENEW_JITTER_MIN_S, RENEW_JITTER_MAX_S]. Tests pass a fixed `random`. */
+export function renewAfterAt(expiresAt: number, random: number = Math.random()): number {
+  const unit = Number.isFinite(random) ? Math.min(1, Math.max(0, random)) : Math.random()
+  const span = RENEW_JITTER_MAX_S - RENEW_JITTER_MIN_S
+  const jitterS = RENEW_JITTER_MIN_S + Math.min(span, Math.floor(unit * (span + 1)))
+  return expiresAt - jitterS * SECOND
+}
+
+/**
+ * Never before half the token's life, or a short-lived token would be due as soon as stored and minted on every
+ * request.
+ */
+export function primaryRenewAfter(obtainedAt: number, expires: number, random?: number): number {
+  return Math.max(renewAfterAt(expires, random), obtainedAt + (expires - obtainedAt) / 2)
+}
+
+export type AppCacheFreshOptions = {
+  now: number
+  signingKid: string
+  /** A mismatched `signingKid` is a miss even before `renewAfter`. */
+  strictSigningKid?: boolean
+  /** Already clamped (see `primaryCovers`). */
+  minValidity?: number
+}
+
+/** Serve without reminting. Decryptability is the caller's check. */
+export function appCacheFresh(record: ShopRecord, options: AppCacheFreshOptions): boolean {
+  if (!isAppTokenCache(record) || record.tokenInvalid) return false
+  if (options.strictSigningKid && record.signingKid !== options.signingKid) return false
+  if (options.now >= record.renewAfter) return false
+  return options.minValidity === undefined || primaryCovers(record, options.now, options.minValidity)
+}
+
+/** A token whose whole life is under `minValidity` counts for its first half, instead of reminting every request. */
+export function primaryCovers(record: ShopRecord & { expires: number }, now: number, minValidity: number): boolean {
+  const lifetime = record.expires - record.pairObtainedAt
+  const required = lifetime > minValidity ? minValidity : lifetime / 2
+  return record.expires - now > required
+}
+
+/** Within the absolute lifetime minus grace: servable when a remint fails during the renew window. */
+export function appCacheServable(record: ShopRecord, now: number): boolean {
+  return isAppTokenCache(record) && !record.tokenInvalid && now < record.expires - APP_CACHE_SERVE_GRACE
+}
+
 type OptionalField = { [K in keyof ShopRecord]-?: undefined extends ShopRecord[K] ? K : never }[keyof ShopRecord]
 
 export function without(record: ShopRecord, field: OptionalField): ShopRecord {
@@ -254,6 +360,11 @@ export type GetContext = {
 export function decideGet(record: ShopRecord, c: GetContext): GetDecision {
   if (c.unreadable) return { kind: 'tokenless', reason: 'unreadable' }
   const canCall = !c.attempted && (c.inflight || !inCooldown(record, c.now, c.credFp))
+
+  // A primary-mode cache left after switching back to fallback mode: not a chain token, so never served.
+  if (record.source === 'app_token') {
+    return { kind: 'needs_reauth', since: Math.min(c.now, record.pairObtainedAt), reason: 'no_refresh_token' }
+  }
 
   const quarantine = record.needsReauth
   if (quarantine) {
@@ -301,6 +412,8 @@ export type ScheduleOptions = { now: number; credFp: string; migrateLegacy: bool
 /** When the record next wants attention, before the one-minute floor; `null` for never. */
 export function dueAt(record: ShopRecord, o: ScheduleOptions): number | null {
   if (record.needsReauth) return record.needsReauth.since + QUARANTINE_GC
+  // Left by primary mode: the alarm's cache branch wipes it (see cacheQuarantineSince).
+  if (record.source === 'app_token') return (record.expires ?? record.pairObtainedAt) + QUARANTINE_GC
   if (o.unreadable) return o.now + UNREADABLE_RECHECK
   const intent = tokenIntent(record)
   if (intent === 'migrate') {
@@ -393,6 +506,8 @@ export function describeRecord(
       since: record.mintRejected.since,
       retryAt: mintRetryAt(record.mintRejected),
     },
+    renewAfter: record.renewAfter,
+    signingKid: record.signingKid,
     nextAlarmAt: nextAlarm,
   })
 }
@@ -471,9 +586,11 @@ export function decideExchange(
   }
 }
 
-/** Over none, legacy, quarantine or unreadable only; a refresh-capable record wins over a flag-off exchange. */
+/** Over none, tokenless, legacy, quarantine or unreadable only; a refresh-capable record wins over a flag-off exchange. */
 export function acceptsLegacyExchange(record: ShopRecord | undefined, unreadable: boolean): boolean {
-  return !record || isLegacy(record) || record.needsReauth !== undefined || unreadable
+  return (
+    !record || (!record.token && !record.refresh) || isLegacy(record) || record.needsReauth !== undefined || unreadable
+  )
 }
 
 /** Rule 6: an expiring exchange without a refresh token wins only by being newer. */
