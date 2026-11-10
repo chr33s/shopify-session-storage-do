@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fix: a dead refresh token now quarantines the shop. Shopify answers it with
+  `401 invalid_grant`, which was classified as a configuration failure (backoff,
+  never quarantined, and counted toward a rollover halt); only
+  `401 invalid_request` was terminal. Both are terminal now. Wrong client
+  credentials answer `400`, so they stay configuration failures. Found by the
+  new `scripts/rehearsal` checks against a live store.
+
 - Optional app-token fallback. With the new `appTokenKey` option on
   `createShopSessionsDurableObject`, `loadOfflineSession` answers with an
   application-only access token (`source: 'app_token'`) while the shop's

@@ -65,8 +65,9 @@ Shopify
   (≤ 30 days after first use, ≤ its expiry); retrying it returns the same pair.
 - Any exchange retires every other refresh token for the shop; a DO refresh that
   succeeds was therefore processed before any exchange it overlaps with.
-- Terminal: refresh `401 invalid_request`; migration `400 invalid_subject_token`
-  / `invalid_requested_token_type`. Transient: network, timeout, `5xx`, `429`,
+- Terminal: refresh `401 invalid_grant` (observed 2026-11; `401
+  invalid_request` also accepted); migration `400 invalid_subject_token`
+  / `invalid_requested_token_type`. A wrong client id or secret answers `400`. Transient: network, timeout, `5xx`, `429`,
   challenge pages. Shop state: `402`, `423`, `404`. Other `4xx`/`3xx`:
   configuration.
 - Migration invalidates the legacy token at once; the identical request within
